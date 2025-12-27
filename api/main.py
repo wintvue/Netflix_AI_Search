@@ -70,16 +70,14 @@ def search_hybrid(
     """Search movies using hybrid FTS + vector search with reranking.
     
     This is the recommended search endpoint that combines:
+    - Anchor resolution (e.g., "like Inception" finds the movie)
+    - Vector search using anchor embeddings
     - Full-text search (FTS) for keyword matches
-    - Vector search for semantic matches
     - Cross-encoder reranking for best results
+    
+    Returns query, anchors, count, and results.
     """
-    results = hybrid_search(q, k)
-    return {
-        "query": q,
-        "count": len(results),
-        "results": results,
-    }
+    return hybrid_search(q, k)
 
 
 @app.get("/health")
