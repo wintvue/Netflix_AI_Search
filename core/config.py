@@ -23,9 +23,9 @@ RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 # Search defaults
 DEFAULT_TOP_K = 20
-FTS_CANDIDATES = 120
-VEC_CANDIDATES = 120
-RERANK_CANDIDATES = 150
+VEC_CANDIDATES = 200    # Vector search candidates (main)
+FTS_CANDIDATES = 60     # FTS candidates (secondary, not dominating)
+RERANK_CANDIDATES = 200
 
 # Logging configuration
 logging.basicConfig(
