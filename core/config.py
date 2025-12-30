@@ -23,9 +23,24 @@ RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 # Search defaults
 DEFAULT_TOP_K = 20
-VEC_CANDIDATES = 200    # Vector search candidates (main)
-FTS_CANDIDATES = 60     # FTS candidates (secondary, not dominating)
-RERANK_CANDIDATES = 200
+
+# Hybrid search configuration (industry-standard RRF approach)
+# Candidate pool sizes for each retrieval method
+VECTOR_CANDIDATES = 100   # Vector (semantic) search candidates
+BM25_CANDIDATES = 100     # Full-text search (BM25/FTS) candidates
+
+# Reciprocal Rank Fusion (RRF) parameters
+# RRF formula: score = Σ 1/(k + rank)
+# k=60 is the standard constant (from Microsoft's original RRF paper)
+RRF_K = 60
+
+# Alpha controls the blend between semantic and keyword search
+# alpha=1.0 -> pure vector, alpha=0.0 -> pure BM25
+# 0.5-0.7 is typical for balanced hybrid search
+HYBRID_ALPHA = 0.5
+
+# Number of candidates to send to the reranker (top RRF results)
+RERANK_CANDIDATES = 50
 
 # Logging configuration
 logging.basicConfig(
