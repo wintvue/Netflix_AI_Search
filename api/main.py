@@ -16,6 +16,7 @@ from core.ai_overview import generate_ai_overview
 from core.config import DEFAULT_TOP_K, HYBRID_ALPHA, get_logger
 from core.model import preload_models
 from core.search import hybrid_search, search_movies, semantic_search
+from core.database import create_db_pool, close_connection
 
 logger = get_logger(__name__)
 
@@ -31,11 +32,14 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Netflix AI Search API...")
     load_times = preload_models()
     app.state.model_load_times = load_times
-    
+
+    create_db_pool()
     yield  # Application runs here
     
     # Shutdown: Cleanup if needed
     logger.info("Shutting down Netflix AI Search API...")
+    close_connection()
+    logger.info("Database connection closed.")
 
 
 app = FastAPI(

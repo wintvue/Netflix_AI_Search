@@ -33,7 +33,7 @@ from core.config import (
     VECTOR_CANDIDATES,
     get_logger,
 )
-from core.database import get_connection
+from core.database import get_connection, put_connection
 from core.model import encode_query, get_reranker
 
 logger = get_logger(__name__)
@@ -271,7 +271,7 @@ def semantic_search(query: str, top_k: int = DEFAULT_TOP_K) -> list[dict]:
             cur.execute(SQL_SEMANTIC, (q_emb, top_k))
             rows = cur.fetchall()
     finally:
-        conn.close()
+        put_connection(conn)
     
     db_time = (time.time() - start) * 1000
     results = [dict(row) for row in rows]
@@ -336,13 +336,22 @@ def hybrid_search(
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             # Vector search
+            logger.info(
+                f"Stage 1 | Vector embedding: {(time.time() - start) * 1000}ms | "
+            )
             cur.execute(SQL_VECTOR_SEARCH, (q_emb, q_emb, VECTOR_CANDIDATES))
+            logger.info(
+                f"Stage 1 | Vector embedding: {(time.time() - start) * 1000}ms | "
+            )
             for rank, row in enumerate(cur.fetchall(), start=1):
                 vector_results.append(RetrievalResult(
                     id=int(row["id"]),
                     score=float(row["score"]),
                     rank=rank,
                 ))
+            logger.info(
+                f"Stage 1 | Vector embedding: {time.time() - start}ms | "
+            )
             
             # BM25/FTS search
             cur.execute(SQL_BM25_SEARCH, (query, query, BM25_CANDIDATES))
@@ -352,8 +361,11 @@ def hybrid_search(
                     score=float(row["score"]),
                     rank=rank,
                 ))
+            logger.info(
+                f"Stage 1 | Vector embedding: {time.time() - start}ms | "
+            )
     finally:
-        conn.close()
+        put_connection(conn)
     
     timings["retrieval_ms"] = (time.time() - start) * 1000
     logger.info(
@@ -418,7 +430,7 @@ def hybrid_search(
             cur.execute(SQL_FETCH_MOVIES, (candidate_ids,))
             movie_rows = {int(row["id"]): dict(row) for row in cur.fetchall()}
     finally:
-        conn.close()
+        put_connection(conn)
     
     timings["fetch_ms"] = (time.time() - start) * 1000
     logger.info(f"Stage 4 | Fetch movies: {timings['fetch_ms']:.2f}ms")
