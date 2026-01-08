@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TypedDict
 
 import numpy as np
+from pgvector import Vector
 import psycopg2.extras
 
 from core.config import (
@@ -47,7 +48,7 @@ SQL_VECTOR_SEARCH = """
 SELECT
     e.movie_id AS id,
     1 - (e.embedding <=> %s) AS score  -- Convert distance to similarity
-FROM movie_embeddings e
+FROM movie_embeddings_10k e
 ORDER BY e.embedding <=> %s ASC
 LIMIT %s;
 """
@@ -88,9 +89,9 @@ WHERE id = ANY(%s);
 SQL_SEMANTIC = """
 SELECT
     m.id, m.title, m.release_date, m.poster_path,
-    m.vote_average, m.vote_count, m.popularity,
+    m.vote_average, m.vote_count, m.popularity, m.overview,
     (e.embedding <=> %s) AS distance
-FROM movie_embeddings e
+FROM movie_embeddings_10k e
 JOIN movies m ON m.id = e.movie_id
 ORDER BY distance ASC
 LIMIT %s;
@@ -202,7 +203,7 @@ def compute_rrf(
     
     # Sort by RRF score descending
     fused.sort(key=lambda x: x.rrf_score, reverse=True)
-    
+    logger.info(f"RRF results: {log_json(fused)}")
     return fused
 
 
@@ -336,23 +337,13 @@ def hybrid_search(
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             # Vector search
-            logger.info(
-                f"Stage 1 | Vector embedding: {(time.time() - start) * 1000}ms | "
-            )
             cur.execute(SQL_VECTOR_SEARCH, (q_emb, q_emb, VECTOR_CANDIDATES))
-            logger.info(
-                f"Stage 1 | Vector embedding: {(time.time() - start) * 1000}ms | "
-            )
             for rank, row in enumerate(cur.fetchall(), start=1):
                 vector_results.append(RetrievalResult(
                     id=int(row["id"]),
                     score=float(row["score"]),
                     rank=rank,
                 ))
-            logger.info(
-                f"Stage 1 | Vector embedding: {time.time() - start}ms | "
-            )
-            
             # BM25/FTS search
             cur.execute(SQL_BM25_SEARCH, (query, query, BM25_CANDIDATES))
             for rank, row in enumerate(cur.fetchall(), start=1):
@@ -361,9 +352,6 @@ def hybrid_search(
                     score=float(row["score"]),
                     rank=rank,
                 ))
-            logger.info(
-                f"Stage 1 | Vector embedding: {time.time() - start}ms | "
-            )
     finally:
         put_connection(conn)
     
@@ -374,11 +362,11 @@ def hybrid_search(
     )
     
     # Log top results from each method
-    logger.info(f"Stage 2 | Vector top-5:\n{log_json([
+    logger.debug(f"Stage 2 | Vector top-5:\n{log_json([
         {'rank': r.rank, 'id': r.id, 'score': round(r.score, 4)}
         for r in vector_results[:5]
     ])}")
-    logger.info(f"Stage 2 | BM25 top-5:\n{log_json([
+    logger.debug(f"Stage 2 | BM25 top-5:\n{log_json([
         {'rank': r.rank, 'id': r.id, 'score': round(r.score, 4)}
         for r in bm25_results[:5]
     ])}")
@@ -396,7 +384,7 @@ def hybrid_search(
     fused_results = compute_rrf(vector_norm, bm25_norm, k=RRF_K, alpha=alpha)
     
     timings["fusion_ms"] = (time.time() - start) * 1000
-    logger.info(
+    logger.debug(
         f"Stage 3 | RRF Fusion: {timings['fusion_ms']:.2f}ms | "
         f"Unique candidates: {len(fused_results)}"
     )
@@ -405,7 +393,7 @@ def hybrid_search(
     candidates = fused_results[:RERANK_CANDIDATES]
     candidate_ids = [c.id for c in candidates]
     
-    logger.info(f"Stage 3 | RRF top-10:\n{log_json([
+    logger.debug(f"Stage 3 | RRF top-10:\n{log_json([
         {'id': c.id, 'rrf_score': round(c.rrf_score, 6), 'vec_rank': c.vector_rank, 'bm25_rank': c.bm25_rank}
         for c in candidates[:10]
     ])}")
@@ -438,26 +426,7 @@ def hybrid_search(
     # ==========================================================================
     # Stage 5: Cross-Encoder Reranking
     # ==========================================================================
-    start = time.time()
-    
-    # Prepare rerank pairs (query, document_text)
     rerank_movies = [movie_rows[cid] for cid in candidate_ids if cid in movie_rows]
-    pairs = [(query, build_rerank_text(m)) for m in rerank_movies]
-    
-    # Get reranker and compute scores
-    reranker = get_reranker()
-    rerank_scores = reranker.predict(pairs)
-    
-    # Attach scores to movies
-    for movie, score in zip(rerank_movies, rerank_scores):
-        movie["rerank_score"] = float(score)
-    
-    # Sort by rerank score
-    rerank_movies.sort(key=lambda m: m["rerank_score"], reverse=True)
-    
-    timings["rerank_ms"] = (time.time() - start) * 1000
-    logger.info(f"Stage 5 | Reranking: {timings['rerank_ms']:.2f}ms")
-    
     # ==========================================================================
     # Stage 6: Final Results
     # ==========================================================================

@@ -83,11 +83,18 @@ def preload_models() -> dict:
     return load_times
 
 
+# def encode_query(query: str) -> str:
+#     """Encode a query string into an embedding vector."""
+#     model = get_embed_model()
+#     embedding = model.encode([query], normalize_embeddings=True).astype(np.float32)[0]
+#     vec_str = "[" + ",".join(f"{x:.6f}" for x in embedding.tolist()) + "]"
+#     return vec_str
+
 def encode_query(query: str) -> np.ndarray:
     """Encode a query string into an embedding vector."""
     model = get_embed_model()
-    return model.encode([query], normalize_embeddings=True).astype(np.float32)[0]
-
+    embedding = model.encode([query], normalize_embeddings=True).astype(np.float32)[0]
+    return np.asarray(embedding, dtype=np.float32)
 
 def rerank(query: str, texts: list[str]) -> list[float]:
     """Rerank texts based on relevance to query.
