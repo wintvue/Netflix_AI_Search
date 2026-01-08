@@ -46,16 +46,21 @@ logger = get_logger(__name__)
 
 SQL_VECTOR_SEARCH = """
 SELECT
-    e.movie_id AS id,
+    m.id, m.title, m.original_title, m.overview, m.tagline, m.genres,
+    m.release_date, m.original_language, m.poster_path,
+    m.vote_average, m.vote_count, m.popularity,
     1 - (e.embedding <=> %s) AS score  -- Convert distance to similarity
 FROM movie_embeddings_10k e
+JOIN movies m ON m.id = e.movie_id
 ORDER BY e.embedding <=> %s ASC
 LIMIT %s;
 """
 
 SQL_BM25_SEARCH = """
 SELECT
-    id,
+    id, title, original_title, overview, tagline, genres,
+    release_date, original_language, poster_path,
+    vote_average, vote_count, popularity,
     ts_rank_cd(
         to_tsvector('english',
             coalesce(title, '') || ' ' ||
@@ -75,15 +80,6 @@ WHERE to_tsvector('english',
     ) @@ websearch_to_tsquery('english', %s)
 ORDER BY score DESC
 LIMIT %s;
-"""
-
-SQL_FETCH_MOVIES = """
-SELECT
-    id, title, original_title, overview, tagline, genres,
-    release_date, original_language, poster_path,
-    vote_average, vote_count, popularity
-FROM movies
-WHERE id = ANY(%s);
 """
 
 SQL_SEMANTIC = """
@@ -333,25 +329,33 @@ def hybrid_search(
     
     vector_results: list[RetrievalResult] = []
     bm25_results: list[RetrievalResult] = []
+    movie_rows: dict[int, dict] = {}  # Store movie data from retrieval
     
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             # Vector search
             cur.execute(SQL_VECTOR_SEARCH, (q_emb, q_emb, VECTOR_CANDIDATES))
             for rank, row in enumerate(cur.fetchall(), start=1):
+                row_dict = dict(row)
+                movie_id = int(row_dict["id"])
                 vector_results.append(RetrievalResult(
-                    id=int(row["id"]),
-                    score=float(row["score"]),
+                    id=movie_id,
+                    score=float(row_dict["score"]),
                     rank=rank,
                 ))
+                movie_rows[movie_id] = row_dict
             # BM25/FTS search
             cur.execute(SQL_BM25_SEARCH, (query, query, BM25_CANDIDATES))
             for rank, row in enumerate(cur.fetchall(), start=1):
+                row_dict = dict(row)
+                movie_id = int(row_dict["id"])
                 bm25_results.append(RetrievalResult(
-                    id=int(row["id"]),
-                    score=float(row["score"]),
+                    id=movie_id,
+                    score=float(row_dict["score"]),
                     rank=rank,
                 ))
+                if movie_id not in movie_rows:
+                    movie_rows[movie_id] = row_dict
     finally:
         put_connection(conn)
     
@@ -409,26 +413,12 @@ def hybrid_search(
         }
     
     # ==========================================================================
-    # Stage 4: Fetch Full Movie Data
-    # ==========================================================================
-    start = time.time()
-    conn = get_connection()
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(SQL_FETCH_MOVIES, (candidate_ids,))
-            movie_rows = {int(row["id"]): dict(row) for row in cur.fetchall()}
-    finally:
-        put_connection(conn)
-    
-    timings["fetch_ms"] = (time.time() - start) * 1000
-    logger.info(f"Stage 4 | Fetch movies: {timings['fetch_ms']:.2f}ms")
-    
-    # ==========================================================================
-    # Stage 5: Cross-Encoder Reranking
+    # Stage 4: Cross-Encoder Reranking
     # ==========================================================================
     rerank_movies = [movie_rows[cid] for cid in candidate_ids if cid in movie_rows]
+    
     # ==========================================================================
-    # Stage 6: Final Results
+    # Stage 5: Final Results
     # ==========================================================================
     results = rerank_movies[:top_k]
     
@@ -444,7 +434,7 @@ def hybrid_search(
     total_time = sum(timings.values())
     timings["total_ms"] = total_time
     
-    logger.info(f"Stage 6 | Final results: {len(results)} | Total: {total_time:.2f}ms")
+    logger.info(f"Stage 5 | Final results: {len(results)} | Total: {total_time:.2f}ms")
     logger.info(f"Hybrid search | Final results:\n{log_json([
         {
             'rank': i+1,

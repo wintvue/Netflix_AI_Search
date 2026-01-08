@@ -63,18 +63,6 @@ def preload_models() -> dict:
     load_times["embed_warmup"] = time.time() - start
     logger.info(f"Embedding warmup in {load_times['embed_warmup']:.2f}s")
     
-    # Load reranker model
-    start = time.time()
-    reranker = get_reranker()
-    load_times["reranker"] = time.time() - start
-    logger.info(f"Reranker model ready in {load_times['reranker']:.2f}s")
-    
-    # Warm up reranker with a test pair
-    start = time.time()
-    _ = reranker.predict([("warmup query", "warmup document")])
-    load_times["reranker_warmup"] = time.time() - start
-    logger.info(f"Reranker warmup in {load_times['reranker_warmup']:.2f}s")
-    
     total = sum(load_times.values())
     logger.info("=" * 60)
     logger.info(f"ALL MODELS READY | Total: {total:.2f}s")
