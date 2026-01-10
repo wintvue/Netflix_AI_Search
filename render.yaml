@@ -3,7 +3,7 @@ services:
     name: netflix-ai-search
     runtime: python
     region: oregon
-    plan: starter
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
     envVars:
@@ -33,7 +33,7 @@ services:
 
 databases:
   - name: netflix-db
-    plan: starter
+    plan: basic
     region: oregon
     postgresMajorVersion: 16
     ipAllowList: []
