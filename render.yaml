@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: netflix-ai-search
+    runtime: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: DB_USER
+        fromDatabase:
+          name: netflix-db
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: netflix-db
+          property: password
+      - key: HOST
+        fromDatabase:
+          name: netflix-db
+          property: host
+      - key: PORT
+        fromDatabase:
+          name: netflix-db
+          property: port
+      - key: DB_NAME
+        fromDatabase:
+          name: netflix-db
+          property: database
+    healthCheckPath: /health
+
+databases:
+  - name: netflix-db
+    plan: starter
+    region: oregon
+    postgresMajorVersion: 16
+    ipAllowList: []
