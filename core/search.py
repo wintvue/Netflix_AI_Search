@@ -283,58 +283,48 @@ def semantic_search(query: str, top_k: int = DEFAULT_TOP_K) -> list[dict]:
 
 
 # ==============================================================================
-# Hybrid Search (RRF-based)
+# Hybrid Search Pipeline Stages
 # ==============================================================================
 
-def hybrid_search(
+@dataclass
+class RetrievalOutput:
+    """Output from the retrieval stage."""
+    vector_results: list[RetrievalResult]
+    bm25_results: list[RetrievalResult]
+    movie_rows: dict[int, dict]
+    elapsed_ms: float
+
+
+@dataclass
+class FusionOutput:
+    """Output from the RRF fusion stage."""
+    fused_results: list[FusedResult]
+    candidates: list[FusedResult]
+    candidate_ids: list[int]
+    elapsed_ms: float
+
+
+def _retrieve_candidates(
     query: str,
-    top_k: int = DEFAULT_TOP_K,
-    alpha: float = HYBRID_ALPHA,
-) -> dict:
+    query_embedding: np.ndarray,
+) -> RetrievalOutput:
     """
-    Hybrid search using Reciprocal Rank Fusion (RRF).
+    Stage 2: Parallel retrieval using Vector search and BM25/FTS.
     
-    This is the industry-standard approach for combining semantic and keyword search:
-    
-    1. **Parallel Retrieval**: Run vector search + BM25/FTS simultaneously
-    2. **Reciprocal Rank Fusion**: Combine using RRF formula
-    3. **Cross-Encoder Reranking**: Rerank top candidates for precision
-    
-    Args:
-        query: Natural language search query
-        top_k: Number of final results to return
-        alpha: Weight for semantic vs keyword (0=BM25, 1=vector, 0.5=balanced)
-    
-    Returns:
-        Dict with query, config, retrieval stats, and ranked results
+    Fetches candidates from both semantic (vector) and keyword (BM25) indexes,
+    storing movie data for later use.
     """
-    query = query.strip()
-    logger.info(f"Hybrid search | Query: '{query}' | Top-K: {top_k} | Alpha: {alpha}")
-    
-    timings = {}
-    
-    # ==========================================================================
-    # Stage 1: Encode Query
-    # ==========================================================================
-    start = time.time()
-    q_emb = encode_query(query)
-    timings["encode_ms"] = (time.time() - start) * 1000
-    logger.info(f"Stage 1 | Query encoding: {timings['encode_ms']:.2f}ms")
-    
-    # ==========================================================================
-    # Stage 2: Parallel Retrieval (Vector + BM25)
-    # ==========================================================================
     start = time.time()
     conn = get_connection()
     
     vector_results: list[RetrievalResult] = []
     bm25_results: list[RetrievalResult] = []
-    movie_rows: dict[int, dict] = {}  # Store movie data from retrieval
+    movie_rows: dict[int, dict] = {}
     
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             # Vector search
-            cur.execute(SQL_VECTOR_SEARCH, (q_emb, q_emb, VECTOR_CANDIDATES))
+            cur.execute(SQL_VECTOR_SEARCH, (query_embedding, query_embedding, VECTOR_CANDIDATES))
             for rank, row in enumerate(cur.fetchall(), start=1):
                 row_dict = dict(row)
                 movie_id = int(row_dict["id"])
@@ -344,6 +334,7 @@ def hybrid_search(
                     rank=rank,
                 ))
                 movie_rows[movie_id] = row_dict
+            
             # BM25/FTS search
             cur.execute(SQL_BM25_SEARCH, (query, query, BM25_CANDIDATES))
             for rank, row in enumerate(cur.fetchall(), start=1):
@@ -359,50 +350,150 @@ def hybrid_search(
     finally:
         put_connection(conn)
     
-    timings["retrieval_ms"] = (time.time() - start) * 1000
+    elapsed_ms = (time.time() - start) * 1000
+    
     logger.info(
-        f"Stage 2 | Retrieval: {timings['retrieval_ms']:.2f}ms | "
+        f"Retrieval | {elapsed_ms:.2f}ms | "
         f"Vector: {len(vector_results)} | BM25: {len(bm25_results)}"
     )
-    
-    # Log top results from each method
-    logger.debug(f"Stage 2 | Vector top-5:\n{log_json([
+    logger.debug(f"Retrieval | Vector top-5:\n{log_json([
         {'rank': r.rank, 'id': r.id, 'score': round(r.score, 4)}
         for r in vector_results[:5]
     ])}")
-    logger.debug(f"Stage 2 | BM25 top-5:\n{log_json([
+    logger.debug(f"Retrieval | BM25 top-5:\n{log_json([
         {'rank': r.rank, 'id': r.id, 'score': round(r.score, 4)}
         for r in bm25_results[:5]
     ])}")
     
-    # ==========================================================================
-    # Stage 3: Reciprocal Rank Fusion (RRF)
-    # ==========================================================================
+    return RetrievalOutput(
+        vector_results=vector_results,
+        bm25_results=bm25_results,
+        movie_rows=movie_rows,
+        elapsed_ms=elapsed_ms,
+    )
+
+
+def _fuse_with_rrf(
+    vector_results: list[RetrievalResult],
+    bm25_results: list[RetrievalResult],
+    alpha: float,
+) -> FusionOutput:
+    """
+    Stage 3: Reciprocal Rank Fusion (RRF) to combine rankings.
+    
+    Normalizes scores from both retrieval methods, then applies RRF
+    to produce a unified ranking.
+    """
     start = time.time()
     
-    # Normalize scores (optional, for debugging/analysis)
+    # Normalize scores for comparability
     vector_norm = normalize_scores(vector_results)
     bm25_norm = normalize_scores(bm25_results)
     
     # Compute RRF fusion
     fused_results = compute_rrf(vector_norm, bm25_norm, k=RRF_K, alpha=alpha)
     
-    timings["fusion_ms"] = (time.time() - start) * 1000
-    logger.debug(
-        f"Stage 3 | RRF Fusion: {timings['fusion_ms']:.2f}ms | "
-        f"Unique candidates: {len(fused_results)}"
-    )
-    
     # Take top candidates for reranking
     candidates = fused_results[:RERANK_CANDIDATES]
     candidate_ids = [c.id for c in candidates]
     
-    logger.debug(f"Stage 3 | RRF top-10:\n{log_json([
+    elapsed_ms = (time.time() - start) * 1000
+    
+    logger.debug(
+        f"RRF Fusion | {elapsed_ms:.2f}ms | "
+        f"Unique candidates: {len(fused_results)}"
+    )
+    logger.debug(f"RRF Fusion | Top-10:\n{log_json([
         {'id': c.id, 'rrf_score': round(c.rrf_score, 6), 'vec_rank': c.vector_rank, 'bm25_rank': c.bm25_rank}
         for c in candidates[:10]
     ])}")
     
-    if not candidate_ids:
+    return FusionOutput(
+        fused_results=fused_results,
+        candidates=candidates,
+        candidate_ids=candidate_ids,
+        elapsed_ms=elapsed_ms,
+    )
+
+
+def _build_final_results(
+    candidate_ids: list[int],
+    candidates: list[FusedResult],
+    movie_rows: dict[int, dict],
+    top_k: int,
+) -> list[dict]:
+    """
+    Stage 4: Build final result list with RRF metadata.
+    
+    Attaches RRF scores and rank information to movie results.
+    """
+    # Get movies in candidate order
+    results = [movie_rows[cid] for cid in candidate_ids if cid in movie_rows][:top_k]
+    
+    # Add RRF metadata
+    rrf_map = {c.id: c for c in candidates}
+    for r in results:
+        fused = rrf_map.get(r["id"])
+        if fused:
+            r["rrf_score"] = fused.rrf_score
+            r["vector_rank"] = fused.vector_rank
+            r["bm25_rank"] = fused.bm25_rank
+    
+    return results
+
+
+# ==============================================================================
+# Hybrid Search (RRF-based)
+# ==============================================================================
+
+def hybrid_search(
+    query: str,
+    top_k: int = DEFAULT_TOP_K,
+    alpha: float = HYBRID_ALPHA,
+) -> dict:
+    """
+    Hybrid search using Reciprocal Rank Fusion (RRF).
+    
+    This is the industry-standard approach for combining semantic and keyword search:
+    
+    1. **Query Encoding**: Convert query to embedding
+    2. **Parallel Retrieval**: Run vector search + BM25/FTS
+    3. **RRF Fusion**: Combine rankings using Reciprocal Rank Fusion
+    4. **Final Results**: Build response with metadata
+    
+    Args:
+        query: Natural language search query
+        top_k: Number of final results to return
+        alpha: Weight for semantic vs keyword (0=BM25, 1=vector, 0.5=balanced)
+    
+    Returns:
+        Dict with query, config, retrieval stats, and ranked results
+    """
+    query = query.strip()
+    logger.info(f"Hybrid search | Query: '{query}' | Top-K: {top_k} | Alpha: {alpha}")
+    
+    timings = {}
+    
+    # Stage 1: Encode Query
+    start = time.time()
+    query_embedding = encode_query(query)
+    timings["encode_ms"] = (time.time() - start) * 1000
+    logger.info(f"Query encoding | {timings['encode_ms']:.2f}ms")
+    
+    # Stage 2: Parallel Retrieval
+    retrieval = _retrieve_candidates(query, query_embedding)
+    timings["retrieval_ms"] = retrieval.elapsed_ms
+    
+    # Stage 3: RRF Fusion
+    fusion = _fuse_with_rrf(
+        retrieval.vector_results,
+        retrieval.bm25_results,
+        alpha,
+    )
+    timings["fusion_ms"] = fusion.elapsed_ms
+    
+    # Early exit if no candidates
+    if not fusion.candidate_ids:
         return {
             "query": query,
             "config": {"alpha": alpha, "rrf_k": RRF_K},
@@ -412,35 +503,23 @@ def hybrid_search(
             "results": [],
         }
     
-    # ==========================================================================
-    # Stage 4: Cross-Encoder Reranking
-    # ==========================================================================
-    rerank_movies = [movie_rows[cid] for cid in candidate_ids if cid in movie_rows]
+    # Stage 4: Build Final Results
+    results = _build_final_results(
+        fusion.candidate_ids,
+        fusion.candidates,
+        retrieval.movie_rows,
+        top_k,
+    )
     
-    # ==========================================================================
-    # Stage 5: Final Results
-    # ==========================================================================
-    results = rerank_movies[:top_k]
+    # Compute total time
+    timings["total_ms"] = sum(timings.values())
     
-    # Add RRF metadata back to results
-    rrf_map = {c.id: c for c in candidates}
-    for r in results:
-        fused = rrf_map.get(r["id"])
-        if fused:
-            r["rrf_score"] = fused.rrf_score
-            r["vector_rank"] = fused.vector_rank
-            r["bm25_rank"] = fused.bm25_rank
-    
-    total_time = sum(timings.values())
-    timings["total_ms"] = total_time
-    
-    logger.info(f"Stage 5 | Final results: {len(results)} | Total: {total_time:.2f}ms")
-    logger.info(f"Hybrid search | Final results:\n{log_json([
+    logger.info(f"Hybrid search | Final: {len(results)} results | Total: {timings['total_ms']:.2f}ms")
+    logger.debug(f"Hybrid search | Results:\n{log_json([
         {
             'rank': i+1,
             'id': r['id'],
             'title': r['title'],
-            'rerank_score': round(r.get('rerank_score', 0), 4),
             'rrf_score': round(r.get('rrf_score', 0), 6),
             'vec_rank': r.get('vector_rank'),
             'bm25_rank': r.get('bm25_rank'),
@@ -459,9 +538,9 @@ def hybrid_search(
         },
         "timings": timings,
         "retrieval": {
-            "vector": len(vector_results),
-            "bm25": len(bm25_results),
-            "fused": len(fused_results),
+            "vector": len(retrieval.vector_results),
+            "bm25": len(retrieval.bm25_results),
+            "fused": len(fusion.fused_results),
         },
         "count": len(results),
         "results": results,
