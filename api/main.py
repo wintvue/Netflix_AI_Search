@@ -20,8 +20,6 @@ from core.model import get_huggingface_client
 
 logger = get_logger(__name__)
 
-import psutil, os
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -31,13 +29,10 @@ async def lifespan(app: FastAPI):
     Preloads all ML models at startup so the first request is fast.
     """
     # Startup: Load all models
-    process = psutil.Process(os.getpid())
-
     logger.info("Starting Netflix AI Search API...")
     # load_times = preload_models()
     get_huggingface_client()
     create_db_pool()
-    print("Memory MB:", process.memory_info().rss / 1024 / 1024)
     yield  # Application runs here
 
     # Shutdown: Cleanup if needed
