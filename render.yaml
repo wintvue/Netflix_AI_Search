@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: netflix-ai-search
+    runtime: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      # Set these in Render Dashboard → Environment:
+      # DB_USER, DB_PASSWORD, HOST, PORT, DB_NAME
