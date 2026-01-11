@@ -11,7 +11,7 @@ from core.config import DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER, get_log
 
 logger = get_logger(__name__)
 
-conn: psycopg2.Connection | None = None
+conn = None
 
 pool: ThreadedConnectionPool | None = None
 
@@ -40,7 +40,7 @@ def create_db_pool():
 def get_connection():
     global pool
     conn = pool.getconn()
-
+    print("Connection:", conn)
     cid = id(conn)
     global _registered_conn_ids
     if cid not in _registered_conn_ids:
