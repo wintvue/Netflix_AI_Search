@@ -17,6 +17,7 @@ pool: ThreadedConnectionPool | None = None
 
 _registered_conn_ids: set[int] | None = set()
 
+
 def create_db_pool():
     """Create a new database connection with pgvector support."""
     global pool
@@ -35,6 +36,7 @@ def create_db_pool():
         )
     return pool
 
+
 def get_connection():
     global pool
     conn = pool.getconn()
@@ -45,7 +47,8 @@ def get_connection():
         register_vector(conn)
         _registered_conn_ids.add(cid)
 
-    return conn # returns a connection from the pool
+    return conn  # returns a connection from the pool
+
 
 def put_connection(conn, close: bool = False):
     global pool
@@ -55,6 +58,7 @@ def put_connection(conn, close: bool = False):
         pool.putconn(conn, close=True)
     else:
         pool.putconn(conn)
+
 
 def init_pool_vectors(pool):
     conns = []
@@ -67,6 +71,7 @@ def init_pool_vectors(pool):
     finally:
         for c in conns:
             pool.putconn(c)
+
 
 # def get_connection():
 #     """Create a new database connection with pgvector support."""
@@ -84,12 +89,14 @@ def init_pool_vectors(pool):
 #         register_vector(conn)
 #     return conn
 
+
 def close_connection():
     """Close the database connection."""
     global conn
     if conn is not None:
         conn.close()
         conn = None
+
 
 WARM_QUERY = """
 SELECT movie_id
@@ -98,10 +105,11 @@ ORDER BY embedding <=> %s
 LIMIT 1;
 """
 
+
 def warm_loop():
     # all-MiniLM-L6-v2 = 384 dimensions
     dummy = np.zeros((384,), dtype=np.float32)
-    
+
     while True:
         try:
             conn = get_connection()
