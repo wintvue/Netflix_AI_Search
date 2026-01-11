@@ -7,3 +7,4 @@ python-dotenv>=1.0.0
 psycopg2-binary
 pgvector
 ollama>=0.4.0
+huggingface_hub

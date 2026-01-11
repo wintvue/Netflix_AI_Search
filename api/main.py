@@ -17,7 +17,7 @@ from core.config import DEFAULT_TOP_K, HYBRID_ALPHA, get_logger
 from core.model import preload_models
 from core.search import hybrid_search, search_movies, semantic_search
 from core.database import create_db_pool, close_connection
-
+from core.model import get_huggingface_client
 logger = get_logger(__name__)
 
 
@@ -30,9 +30,8 @@ async def lifespan(app: FastAPI):
     """
     # Startup: Load all models
     logger.info("Starting Netflix AI Search API...")
-    load_times = preload_models()
-    app.state.model_load_times = load_times
-
+    # load_times = preload_models()
+    get_huggingface_client()
     create_db_pool()
     yield  # Application runs here
     

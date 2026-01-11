@@ -35,7 +35,7 @@ from core.config import (
     get_logger,
 )
 from core.database import get_connection, put_connection
-from core.model import encode_query, get_reranker
+from core.model import encode_query
 
 logger = get_logger(__name__)
 
