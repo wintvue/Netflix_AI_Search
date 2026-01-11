@@ -40,7 +40,6 @@ def create_db_pool():
 def get_connection():
     global pool
     conn = pool.getconn()
-    print("Connection:", conn)
     cid = id(conn)
     global _registered_conn_ids
     if cid not in _registered_conn_ids:
