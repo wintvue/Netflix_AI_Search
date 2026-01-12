@@ -3,8 +3,9 @@
 
 import json
 import os
+import re
 import time
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 from ollama import Client
 
@@ -18,45 +19,47 @@ OLLAMA_KEEP_ALIVE = "10m"
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "https://ollama.com")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
 
-# Initialize Ollama client
+# Singleton client
 _ollama_client: Client | None = None
+
+# Status type
+Status = Literal["success", "parse_error", "error", "no_results"]
 
 
 def get_ollama_client() -> Client:
     """Get or create the Ollama client instance."""
     global _ollama_client
     if _ollama_client is None:
-        client_kwargs = {"host": OLLAMA_HOST}
-        if OLLAMA_API_KEY:
-            client_kwargs["headers"] = {"Authorization": f"Bearer {OLLAMA_API_KEY}"}
-        _ollama_client = Client(**client_kwargs)
+        headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
+        _ollama_client = Client(host=OLLAMA_HOST, headers=headers or None)
     return _ollama_client
+
 
 SYSTEM_PROMPT = """You are an AI assistant that summarizes and explains movie search results.
 
 STRICT RULES:
-- You may ONLY use facts explicitly provided in the input.
-- Do NOT add new plot points, trivia, cast, awards, or opinions.
+- Do NOT add new trivia, cast, awards, or opinions.
 - If information is missing, do not guess.
-- Do not use external knowledge.
-- Do not say "it is widely known" or similar phrases.
+- If you know the movie plot, explain it.
+- Do NOT make up plot points if you don't know the movie plot.
 
 Your task:
-1. Write a short overview explaining why these movies match the user query.
-2. For each movie, write 1–2 sentences explaining the match.
+1. Write a short overview explaining why these movies match the user search query.
+2. For each movie, write 3–4 sentences explaining the match.
 
 Tone:
 - Neutral, factual, concise.
 - No hype language.
+- Dont use sentence like "This movie is a great match for the user search query" or "This movie is a good match for the user search query".
 
 Output MUST be valid JSON matching this schema exactly:
 {
-  "overview": "Brief summary of why these movies match the query",
+  "overview": "Brief summary of why these movies in the list match the user search query",
   "movie_explanations": [
     {
       "id": <movie_id>,
       "title": "<movie_title>",
-      "explanation": "1-2 sentences explaining why this movie matches the query"
+      "explanation": "3-4 sentences explaining the plot and why this movie matches the search query"
     }
   ]
 }
@@ -77,43 +80,70 @@ class AIOverviewResponse(TypedDict):
     movie_explanations: list[MovieExplanation]
 
 
-def format_movies_context(query: str, movies: list[dict]) -> str:
-    """
-    Format movie results as context for the AI model.
+def _strip_markdown_fences(content: str) -> str:
+    """Remove markdown code fences from JSON content."""
+    content = content.strip()
+    # Remove opening fence with optional language specifier
+    content = re.sub(r'^```(?:json)?\s*', '', content)
+    # Remove closing fence
+    content = re.sub(r'\s*```$', '', content)
+    return content.strip()
+
+
+def _build_response(
+    overview: str,
+    movie_explanations: list[MovieExplanation],
+    model: str,
+    generation_time_ms: float,
+    status: Status,
+    error: str | None = None,
+    eval_count: int | None = None,
+    prompt_eval_count: int | None = None,
+) -> dict:
+    """Build a standardized AI overview response."""
+    metadata = {
+        "model": model,
+        "generation_time_ms": round(generation_time_ms, 2),
+        "status": status,
+    }
+    if status == "success":
+        metadata["eval_count"] = eval_count
+        metadata["prompt_eval_count"] = prompt_eval_count
+    elif error:
+        metadata["error"] = error
     
-    Args:
-        query: The user's search query
-        movies: List of movie dicts from search results
-        
-    Returns:
-        Formatted context string for the AI prompt
-    """
-    context_parts = [f"User Query: {query}", "", "Search Results:"]
+    return {
+        "overview": overview,
+        "movie_explanations": movie_explanations,
+        "ai_metadata": metadata,
+    }
+
+
+# Movie fields to include in context
+_MOVIE_FIELDS = [
+    ("tagline", "Tagline"),
+    ("genres", "Genres"),
+    ("overview", "Overview"),
+    ("release_date", "Release Date"),
+]
+
+
+def format_movies_context(query: str, movies: list[dict]) -> str:
+    """Format movie results as context for the AI model."""
+    lines = [f"User Query: {query}", "", "Search Results:"]
     
     for i, movie in enumerate(movies, 1):
-        movie_info = [
-            f"\n{i}. Movie ID: {movie.get('id')}",
-            f"   Title: {movie.get('title', 'Unknown')}",
-        ]
+        lines.append(f"\n{i}. Movie ID: {movie.get('id')}")
+        lines.append(f"   Title: {movie.get('title', 'Unknown')}")
         
-        if movie.get('tagline'):
-            movie_info.append(f"   Tagline: {movie['tagline']}")
+        for key, label in _MOVIE_FIELDS:
+            if value := movie.get(key):
+                lines.append(f"   {label}: {value}")
         
-        if movie.get('genres'):
-            movie_info.append(f"   Genres: {movie['genres']}")
-        
-        if movie.get('overview'):
-            movie_info.append(f"   Overview: {movie['overview']}")
-        
-        if movie.get('release_date'):
-            movie_info.append(f"   Release Date: {movie['release_date']}")
-        
-        if movie.get('vote_average'):
-            movie_info.append(f"   Rating: {movie['vote_average']}/10")
-        
-        context_parts.extend(movie_info)
+        if rating := movie.get('vote_average'):
+            lines.append(f"   Rating: {rating}/10")
     
-    return "\n".join(context_parts)
+    return "\n".join(lines)
 
 
 def generate_ai_overview(
@@ -127,42 +157,30 @@ def generate_ai_overview(
     Args:
         query: The user's search query
         movies: List of movie dicts from search results
-        model: Ollama model to use (default: qwen2.5:7b)
+        model: Ollama model to use
         
     Returns:
         Dict containing overview, movie explanations, and generation metadata
     """
     if not movies:
-        return {
-            "overview": "No movies found matching your query.",
-            "movie_explanations": [],
-            "ai_metadata": {
-                "model": model,
-                "generation_time_ms": 0,
-                "status": "no_results",
-            }
-        }
+        return _build_response(
+            overview="No movies found matching your query.",
+            movie_explanations=[],
+            model=model,
+            generation_time_ms=0,
+            status="no_results",
+        )
     
     logger.info(f"AI Overview | Query: '{query}' | Movies: {len(movies)} | Model: {model}")
-    
-    # Format the context
     context = format_movies_context(query, movies)
-    
     start = time.time()
     
     try:
-        client = get_ollama_client()
-        response = client.chat(
+        response = get_ollama_client().chat(
             model=model,
             messages=[
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT,
-                },
-                {
-                    "role": "user",
-                    "content": context,
-                },
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": context},
             ],
             keep_alive=OLLAMA_KEEP_ALIVE,
         )
@@ -173,70 +191,49 @@ def generate_ai_overview(
         logger.info(f"AI Overview | Generation: {generation_time:.2f}ms")
         logger.debug(f"AI Overview | Raw response: {raw_content[:500]}...")
         
-        # Parse the JSON response
-        try:
-            # Clean up potential markdown code fences
-            content = raw_content.strip()
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.startswith("```"):
-                content = content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-            content = content.strip()
-            
-            parsed: AIOverviewResponse = json.loads(content)
-            
-            return {
-                "overview": parsed.get("overview", ""),
-                "movie_explanations": parsed.get("movie_explanations", []),
-                "ai_metadata": {
-                    "model": model,
-                    "generation_time_ms": round(generation_time, 2),
-                    "status": "success",
-                    "eval_count": response.get("eval_count"),
-                    "prompt_eval_count": response.get("prompt_eval_count"),
-                }
-            }
-            
-        except json.JSONDecodeError as e:
-            logger.warning(f"AI Overview | JSON parse error: {e}")
-            logger.warning(f"AI Overview | Raw content: {raw_content}")
-            
-            # Return raw content as fallback
-            return {
-                "overview": raw_content,
-                "movie_explanations": [],
-                "ai_metadata": {
-                    "model": model,
-                    "generation_time_ms": round(generation_time, 2),
-                    "status": "parse_error",
-                    "error": str(e),
-                }
-            }
-            
+        # Parse JSON response
+        content = _strip_markdown_fences(raw_content)
+        parsed: AIOverviewResponse = json.loads(content)
+        
+        return _build_response(
+            overview=parsed.get("overview", ""),
+            movie_explanations=parsed.get("movie_explanations", []),
+            model=model,
+            generation_time_ms=generation_time,
+            status="success",
+            eval_count=response.get("eval_count"),
+            prompt_eval_count=response.get("prompt_eval_count"),
+        )
+        
+    except json.JSONDecodeError as e:
+        generation_time = (time.time() - start) * 1000
+        logger.warning(f"AI Overview | JSON parse error: {e}")
+        logger.warning(f"AI Overview | Raw content: {raw_content}")
+        
+        return _build_response(
+            overview=raw_content,
+            movie_explanations=[],
+            model=model,
+            generation_time_ms=generation_time,
+            status="parse_error",
+            error=str(e),
+        )
+        
     except Exception as e:
         generation_time = (time.time() - start) * 1000
         logger.error(f"AI Overview | Error: {e}")
         
-        return {
-            "overview": "",
-            "movie_explanations": [],
-            "ai_metadata": {
-                "model": model,
-                "generation_time_ms": round(generation_time, 2),
-                "status": "error",
-                "error": str(e),
-            }
-        }
+        return _build_response(
+            overview="",
+            movie_explanations=[],
+            model=model,
+            generation_time_ms=generation_time,
+            status="error",
+            error=str(e),
+        )
 
-
-# ==============================================================================
-# Main (for testing)
-# ==============================================================================
 
 if __name__ == "__main__":
-    # Test with sample movies
     test_movies = [
         {
             "id": 1,
@@ -260,4 +257,3 @@ if __name__ == "__main__":
     
     result = generate_ai_overview("mind-bending sci-fi movies", test_movies)
     print(json.dumps(result, indent=2))
-
