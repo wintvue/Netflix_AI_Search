@@ -72,23 +72,6 @@ def init_pool_vectors(pool):
             pool.putconn(c)
 
 
-# def get_connection():
-#     """Create a new database connection with pgvector support."""
-#     global conn
-#     logger.info(f"Getting database connection: {conn is None}")
-#     if conn is None:
-#         logger.debug("Creating database connection")
-#         conn = psycopg2.connect(
-#             user=DB_USER,
-#             password=DB_PASSWORD,
-#             host=DB_HOST,
-#             port=DB_PORT,
-#             dbname=DB_NAME,
-#         )
-#         register_vector(conn)
-#     return conn
-
-
 def close_connection():
     """Close the database connection."""
     global conn
