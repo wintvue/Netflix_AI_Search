@@ -22,7 +22,7 @@ EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 # Search defaults
-DEFAULT_TOP_K = 20
+DEFAULT_TOP_K = 100
 
 # Hybrid search configuration (industry-standard RRF approach)
 # Candidate pool sizes for each retrieval method
@@ -37,7 +37,7 @@ RRF_K = 60
 # Alpha controls the blend between semantic and keyword search
 # alpha=1.0 -> pure vector, alpha=0.0 -> pure BM25
 # 0.5-0.7 is typical for balanced hybrid search
-HYBRID_ALPHA = 0.5
+HYBRID_ALPHA = 0.8
 
 # Number of candidates to send to the reranker (top RRF results)
 RERANK_CANDIDATES = 50
