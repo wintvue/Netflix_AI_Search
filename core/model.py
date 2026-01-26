@@ -21,7 +21,7 @@ def get_huggingface_client() -> InferenceClient:
             provider="auto",
             api_key=os.environ["HF_TOKEN"],
         )
-        logger.info("Hugging Face client loaded successfully")
+        logger.info("Hugging Face client loaded successfully") 
     return client
 
 
