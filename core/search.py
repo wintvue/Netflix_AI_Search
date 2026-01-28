@@ -284,10 +284,19 @@ def semantic_search(query: str, top_k: int = DEFAULT_TOP_K) -> list[dict]:
 
     logger.info(f"Semantic search | DB: {db_time:.2f}ms | Results: {len(results)}")
     logger.info(
-        f"Semantic search | Results:\n{log_json([
-        {'rank': i+1, 'id': r['id'], 'title': r['title'], 'distance': round(r['distance'], 4)}
-        for i, r in enumerate(results)
-    ])}"
+        f"Semantic search | Results:\n{
+            log_json(
+                [
+                    {
+                        'rank': i + 1,
+                        'id': r['id'],
+                        'title': r['title'],
+                        'distance': round(r['distance'], 4),
+                    }
+                    for i, r in enumerate(results)
+                ]
+            )
+        }"
     )
 
     return results
@@ -377,16 +386,24 @@ def _retrieve_candidates(
         f"Vector: {len(vector_results)} | BM25: {len(bm25_results)}"
     )
     logger.debug(
-        f"Retrieval | Vector top-5:\n{log_json([
-        {'rank': r.rank, 'id': r.id, 'score': round(r.score, 4)}
-        for r in vector_results[:5]
-    ])}"
+        f"Retrieval | Vector top-5:\n{
+            log_json(
+                [
+                    {'rank': r.rank, 'id': r.id, 'score': round(r.score, 4)}
+                    for r in vector_results[:5]
+                ]
+            )
+        }"
     )
     logger.debug(
-        f"Retrieval | BM25 top-5:\n{log_json([
-        {'rank': r.rank, 'id': r.id, 'score': round(r.score, 4)}
-        for r in bm25_results[:5]
-    ])}"
+        f"Retrieval | BM25 top-5:\n{
+            log_json(
+                [
+                    {'rank': r.rank, 'id': r.id, 'score': round(r.score, 4)}
+                    for r in bm25_results[:5]
+                ]
+            )
+        }"
     )
 
     return RetrievalOutput(
@@ -424,13 +441,22 @@ def _fuse_with_rrf(
     elapsed_ms = (time.time() - start) * 1000
 
     logger.debug(
-        f"RRF Fusion | {elapsed_ms:.2f}ms | " f"Unique candidates: {len(fused_results)}"
+        f"RRF Fusion | {elapsed_ms:.2f}ms | Unique candidates: {len(fused_results)}"
     )
     logger.debug(
-        f"RRF Fusion | Top-10:\n{log_json([
-        {'id': c.id, 'rrf_score': round(c.rrf_score, 6), 'vec_rank': c.vector_rank, 'bm25_rank': c.bm25_rank}
-        for c in candidates[:10]
-    ])}"
+        f"RRF Fusion | Top-10:\n{
+            log_json(
+                [
+                    {
+                        'id': c.id,
+                        'rrf_score': round(c.rrf_score, 6),
+                        'vec_rank': c.vector_rank,
+                        'bm25_rank': c.bm25_rank,
+                    }
+                    for c in candidates[:10]
+                ]
+            )
+        }"
     )
 
     return FusionOutput(
@@ -544,17 +570,21 @@ def hybrid_search(
         f"Hybrid search | Final: {len(results)} results | Total: {timings['total_ms']:.2f}ms"
     )
     logger.debug(
-        f"Hybrid search | Results:\n{log_json([
-        {
-            'rank': i+1,
-            'id': r['id'],
-            'title': r['title'],
-            'rrf_score': round(r.get('rrf_score', 0), 6),
-            'vec_rank': r.get('vector_rank'),
-            'bm25_rank': r.get('bm25_rank'),
-        }
-        for i, r in enumerate(results)
-    ])}"
+        f"Hybrid search | Results:\n{
+            log_json(
+                [
+                    {
+                        'rank': i + 1,
+                        'id': r['id'],
+                        'title': r['title'],
+                        'rrf_score': round(r.get('rrf_score', 0), 6),
+                        'vec_rank': r.get('vector_rank'),
+                        'bm25_rank': r.get('bm25_rank'),
+                    }
+                    for i, r in enumerate(results)
+                ]
+            )
+        }"
     )
 
     return {
@@ -590,7 +620,7 @@ if __name__ == "__main__":
     ]
 
     for q in queries:
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print(f"Query: {q}")
         print("=" * 80)
 

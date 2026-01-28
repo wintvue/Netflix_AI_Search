@@ -30,7 +30,9 @@ def get_ollama_client() -> Client:
     """Get or create the Ollama client instance."""
     global _ollama_client
     if _ollama_client is None:
-        headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
+        headers = (
+            {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
+        )
         _ollama_client = Client(host=OLLAMA_HOST, headers=headers or None)
     return _ollama_client
 
@@ -69,6 +71,7 @@ Respond ONLY with valid JSON. No markdown, no code fences, no extra text."""
 
 class MovieExplanation(TypedDict):
     """Explanation for a single movie match."""
+
     id: int
     title: str
     explanation: str
@@ -76,6 +79,7 @@ class MovieExplanation(TypedDict):
 
 class AIOverviewResponse(TypedDict):
     """AI overview response structure."""
+
     overview: str
     movie_explanations: list[MovieExplanation]
 
@@ -84,9 +88,9 @@ def _strip_markdown_fences(content: str) -> str:
     """Remove markdown code fences from JSON content."""
     content = content.strip()
     # Remove opening fence with optional language specifier
-    content = re.sub(r'^```(?:json)?\s*', '', content)
+    content = re.sub(r"^```(?:json)?\s*", "", content)
     # Remove closing fence
-    content = re.sub(r'\s*```$', '', content)
+    content = re.sub(r"\s*```$", "", content)
     return content.strip()
 
 
@@ -111,7 +115,7 @@ def _build_response(
         metadata["prompt_eval_count"] = prompt_eval_count
     elif error:
         metadata["error"] = error
-    
+
     return {
         "overview": overview,
         "movie_explanations": movie_explanations,
@@ -131,18 +135,18 @@ _MOVIE_FIELDS = [
 def format_movies_context(query: str, movies: list[dict]) -> str:
     """Format movie results as context for the AI model."""
     lines = [f"User Query: {query}", "", "Search Results:"]
-    
+
     for i, movie in enumerate(movies, 1):
         lines.append(f"\n{i}. Movie ID: {movie.get('id')}")
         lines.append(f"   Title: {movie.get('title', 'Unknown')}")
-        
+
         for key, label in _MOVIE_FIELDS:
             if value := movie.get(key):
                 lines.append(f"   {label}: {value}")
-        
-        if rating := movie.get('vote_average'):
+
+        if rating := movie.get("vote_average"):
             lines.append(f"   Rating: {rating}/10")
-    
+
     return "\n".join(lines)
 
 
@@ -153,12 +157,12 @@ def generate_ai_overview(
 ) -> dict:
     """
     Generate an AI overview explaining search results using Ollama.
-    
+
     Args:
         query: The user's search query
         movies: List of movie dicts from search results
         model: Ollama model to use
-        
+
     Returns:
         Dict containing overview, movie explanations, and generation metadata
     """
@@ -170,11 +174,13 @@ def generate_ai_overview(
             generation_time_ms=0,
             status="no_results",
         )
-    
-    logger.info(f"AI Overview | Query: '{query}' | Movies: {len(movies)} | Model: {model}")
+
+    logger.info(
+        f"AI Overview | Query: '{query}' | Movies: {len(movies)} | Model: {model}"
+    )
     context = format_movies_context(query, movies)
     start = time.time()
-    
+
     try:
         response = get_ollama_client().chat(
             model=model,
@@ -184,17 +190,17 @@ def generate_ai_overview(
             ],
             keep_alive=OLLAMA_KEEP_ALIVE,
         )
-        
+
         generation_time = (time.time() - start) * 1000
         raw_content = response["message"]["content"]
-        
+
         logger.info(f"AI Overview | Generation: {generation_time:.2f}ms")
         logger.debug(f"AI Overview | Raw response: {raw_content[:500]}...")
-        
+
         # Parse JSON response
         content = _strip_markdown_fences(raw_content)
         parsed: AIOverviewResponse = json.loads(content)
-        
+
         return _build_response(
             overview=parsed.get("overview", ""),
             movie_explanations=parsed.get("movie_explanations", []),
@@ -204,12 +210,12 @@ def generate_ai_overview(
             eval_count=response.get("eval_count"),
             prompt_eval_count=response.get("prompt_eval_count"),
         )
-        
+
     except json.JSONDecodeError as e:
         generation_time = (time.time() - start) * 1000
         logger.warning(f"AI Overview | JSON parse error: {e}")
         logger.warning(f"AI Overview | Raw content: {raw_content}")
-        
+
         return _build_response(
             overview=raw_content,
             movie_explanations=[],
@@ -218,11 +224,11 @@ def generate_ai_overview(
             status="parse_error",
             error=str(e),
         )
-        
+
     except Exception as e:
         generation_time = (time.time() - start) * 1000
         logger.error(f"AI Overview | Error: {e}")
-        
+
         return _build_response(
             overview="",
             movie_explanations=[],
@@ -254,6 +260,6 @@ if __name__ == "__main__":
             "vote_average": 8.2,
         },
     ]
-    
+
     result = generate_ai_overview("mind-bending sci-fi movies", test_movies)
     print(json.dumps(result, indent=2))
