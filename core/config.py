@@ -26,8 +26,8 @@ DEFAULT_TOP_K = 100
 
 # Hybrid search configuration (industry-standard RRF approach)
 # Candidate pool sizes for each retrieval method
-VECTOR_CANDIDATES = 100   # Vector (semantic) search candidates
-BM25_CANDIDATES = 100     # Full-text search (BM25/FTS) candidates
+VECTOR_CANDIDATES = 100  # Vector (semantic) search candidates
+BM25_CANDIDATES = 100  # Full-text search (BM25/FTS) candidates
 
 # Reciprocal Rank Fusion (RRF) parameters
 # RRF formula: score = Σ 1/(k + rank)
@@ -49,7 +49,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
+
 def get_logger(name: str) -> logging.Logger:
     """Get a configured logger."""
     return logging.getLogger(name)
-

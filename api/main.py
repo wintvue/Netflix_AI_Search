@@ -103,7 +103,7 @@ async def log_requests(request: Request, call_next):
 
 @app.get("/search/keyword")
 def search_keyword(
-    query: str = Query(..., description="Search query for movie titles")
+    query: str = Query(..., description="Search query for movie titles"),
 ):
     """Search movies by title keyword."""
     results = search_movies(query)

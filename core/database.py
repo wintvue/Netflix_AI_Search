@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Database connection handling."""
 
-import psycopg2
-import psycopg2.extras
+import time
+
+import numpy as np
 from pgvector.psycopg2 import register_vector
 from psycopg2.pool import ThreadedConnectionPool
-import numpy as np
-import time
+
 from core.config import DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER, get_logger
 
 logger = get_logger(__name__)
