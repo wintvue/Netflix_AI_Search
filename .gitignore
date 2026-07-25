@@ -10,6 +10,12 @@ __pycache__/
 *.so
 .Python
 
+# Packaging / test artifacts
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
 # Environment variables
 .env
 .env.local

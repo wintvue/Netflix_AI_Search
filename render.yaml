@@ -4,11 +4,21 @@ services:
     runtime: python
     region: singapore
     plan: free
-    buildCommand: pip install -r requirements.txt
+    # Installs the package itself so `core` / `api` import without path hacks.
+    buildCommand: pip install -r requirements.txt && pip install -e . --no-deps
     startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: "3.11"
       # Set these in Render Dashboard → Environment:
-      # DB_USER, DB_PASSWORD, HOST, PORT, DB_NAME
+      #
+      #   DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME
+      #   HF_TOKEN
+      #   OLLAMA_API_KEY        (only if ai_overview is used)
+      #   CORS_ORIGINS          (comma-separated frontend origins)
+      #
+      # Use DB_HOST/DB_PORT, never bare HOST/PORT: Render injects PORT for the
+      # web listener above, so a database port read from PORT would point at
+      # the web port. The app refuses that fallback on Render and logs a
+      # warning; see .env.example for the full list of settings.

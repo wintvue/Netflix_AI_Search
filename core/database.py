@@ -1,108 +1,157 @@
 #!/usr/bin/env python3
-"""Database connection handling."""
+"""Database connection pooling with pgvector support."""
 
-import psycopg2
-import psycopg2.extras
+import threading
+from contextlib import contextmanager
+
 from pgvector.psycopg2 import register_vector
 from psycopg2.pool import ThreadedConnectionPool
-import numpy as np
-import time
-from core.config import DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER, get_logger
+
+from core.config import (
+    DB_CONNECT_TIMEOUT,
+    DB_HOST,
+    DB_NAME,
+    DB_PASSWORD,
+    DB_POOL_MAX,
+    DB_POOL_MIN,
+    DB_PORT,
+    DB_USER,
+    get_logger,
+    missing_db_settings,
+)
+from core.errors import ConfigurationError
 
 logger = get_logger(__name__)
 
-conn = None
-
 pool: ThreadedConnectionPool | None = None
+_pool_lock = threading.Lock()
 
-_registered_conn_ids: set[int] | None = set()
+# psycopg2's pool raises PoolError the moment it is exhausted rather than
+# waiting for a connection. Requests arrive on a threadpool far larger than the
+# pool (asyncio.to_thread and FastAPI's sync-endpoint executor both default to
+# ~32 workers), so callers queue on this semaphore instead of erroring out.
+_pool_slots: threading.Semaphore | None = None
+
+# How long a caller waits for a pool slot before giving up.
+_ACQUIRE_TIMEOUT_SECONDS = 10
 
 
-def create_db_pool():
-    """Create a new database connection with pgvector support."""
-    global pool
-    logger.info(f"Getting database connection pool: {pool is None}")
-    if pool is None:
-        logger.info("Creating database connection pool")
-        pool = ThreadedConnectionPool(
-            minconn=1,
-            maxconn=10,
-            host=DB_HOST,
-            database=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            port=DB_PORT,
-            connect_timeout=5,
-        )
+def create_db_pool() -> ThreadedConnectionPool:
+    """Create the connection pool if it does not already exist."""
+    global pool, _pool_slots
+
+    if pool is not None:
+        return pool
+
+    with _pool_lock:
+        if pool is None:
+            missing = missing_db_settings()
+            if missing:
+                raise ConfigurationError(
+                    f"Missing database settings: {', '.join(missing)}. "
+                    "See .env.example."
+                )
+
+            logger.info(
+                "Creating database connection pool (min=%d, max=%d) to %s:%s/%s",
+                DB_POOL_MIN,
+                DB_POOL_MAX,
+                DB_HOST,
+                DB_PORT,
+                DB_NAME,
+            )
+            pool = ThreadedConnectionPool(
+                minconn=DB_POOL_MIN,
+                maxconn=DB_POOL_MAX,
+                host=DB_HOST,
+                database=DB_NAME,
+                user=DB_USER,
+                password=DB_PASSWORD,
+                port=DB_PORT,
+                connect_timeout=DB_CONNECT_TIMEOUT,
+            )
+            _pool_slots = threading.Semaphore(DB_POOL_MAX)
     return pool
 
 
 def get_connection():
-    global pool
-    conn = pool.getconn()
-    cid = id(conn)
-    global _registered_conn_ids
-    if cid not in _registered_conn_ids:
-        register_vector(conn)
-        _registered_conn_ids.add(cid)
+    """
+    Check out a pooled connection with pgvector registered on it.
 
-    return conn  # returns a connection from the pool
+    Every caller must return it via `put_connection`; prefer the `connection()`
+    context manager, which does that for you.
+    """
+    if pool is None or _pool_slots is None:
+        raise ConfigurationError(
+            "Database pool is not initialized; call create_db_pool() first"
+        )
 
+    if not _pool_slots.acquire(timeout=_ACQUIRE_TIMEOUT_SECONDS):
+        raise TimeoutError(
+            f"Timed out after {_ACQUIRE_TIMEOUT_SECONDS}s waiting for a database "
+            f"connection (pool size {DB_POOL_MAX})"
+        )
 
-def put_connection(conn, close: bool = False):
-    global pool
-    cid = id(conn)
-    if close:
-        _registered_conn_ids.discard(cid)
-        pool.putconn(conn, close=True)
-    else:
-        pool.putconn(conn)
-
-
-def init_pool_vectors(pool):
-    conns = []
     try:
-        # Initialize all existing connections in the pool
-        for _ in range(pool.minconn):
-            conn = pool.getconn()
-            register_vector(conn)
-            conns.append(conn)
-    finally:
-        for c in conns:
-            pool.putconn(c)
+        conn = pool.getconn()
+    except Exception:
+        _pool_slots.release()
+        raise
 
-
-def close_connection():
-    """Close the database connection."""
-    global conn
-    if conn is not None:
-        conn.close()
-        conn = None
-
-
-WARM_QUERY = """
-SELECT movie_id
-FROM movie_embeddings
-ORDER BY embedding <=> %s
-LIMIT 1;
-"""
-
-
-def warm_loop():
-    # all-MiniLM-L6-v2 = 384 dimensions
-    dummy = np.zeros((384,), dtype=np.float32)
-
-    while True:
+    # Track registration on the connection object itself. Keying a set on
+    # id(conn) would be wrong: CPython recycles object ids, so a new connection
+    # could inherit a closed one's id and skip pgvector registration.
+    if not getattr(conn, "_pgvector_registered", False):
         try:
-            conn = get_connection()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(WARM_QUERY, (dummy,))
-                    cur.fetchone()
-                    logger.info("Warm loop query executed")
-            finally:
-                put_connection(conn)
-        except Exception as e:
-            logger.warning(f"Warm loop failed: {e}")
+            register_vector(conn)
+        except Exception:
+            put_connection(conn, close=True)
+            raise
+        conn._pgvector_registered = True
 
-        time.sleep(60)  # 1 minute
+    return conn
+
+
+def put_connection(conn, close: bool = False) -> None:
+    """Return a connection to the pool, optionally discarding it."""
+    if pool is None:
+        return
+    try:
+        pool.putconn(conn, close=close)
+    finally:
+        if _pool_slots is not None:
+            _pool_slots.release()
+
+
+@contextmanager
+def connection():
+    """Context manager that always returns the connection to the pool."""
+    conn = get_connection()
+    try:
+        yield conn
+    finally:
+        put_connection(conn)
+
+
+def close_pool() -> None:
+    """Close every pooled connection. Safe to call more than once."""
+    global pool, _pool_slots
+    with _pool_lock:
+        if pool is not None:
+            pool.closeall()
+            pool = None
+            _pool_slots = None
+            logger.info("Database connection pool closed")
+
+
+def ping() -> bool:
+    """Round-trip a trivial query to prove the database is reachable."""
+    try:
+        with connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1;")
+                cur.fetchone()
+        return True
+    except Exception as e:
+        logger.warning("Database ping failed: %s", e)
+        return False
