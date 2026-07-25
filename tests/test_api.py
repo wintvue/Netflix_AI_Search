@@ -9,12 +9,25 @@ import api.main as main
 def fake_response(query="q", count=2):
     return {
         "query": query,
-        "config": {"alpha": 0.8, "rrf_k": 60},
-        "timings": {"encode_ms": 1.0, "total_ms": 3.5},
+        "config": {
+            "alpha": 0.8,
+            "rrf_k": 60,
+            "vector_candidates": 150,
+            "bm25_candidates": 150,
+            "rerank_candidates": 100,
+            "reranked": True,
+        },
+        "timings": {
+            "encode_ms": 1.0,
+            "retrieval_ms": 2.0,
+            "fusion_ms": 0.5,
+            "rerank_ms": 3.0,
+            "total_ms": 6.5,
+        },
         "retrieval": {"vector": 150, "bm25": 40, "fused": 170},
         "count": count,
         "results": [
-            {"id": i, "title": f"Movie {i}", "rrf_score": 0.01}
+            {"id": i, "title": f"Movie {i}", "rrf_score": 0.01, "rerank_score": 0.9}
             for i in range(1, count + 1)
         ],
     }
@@ -33,7 +46,7 @@ def make_client(monkeypatch):
             main, "hybrid_search", lambda q, k, alpha: fake_response(q, k)
         )
         monkeypatch.setattr(
-            main, "search_movies", lambda q: fake_response(q)["results"]
+            main, "search_movies", lambda q, k: fake_response(q, k)["results"]
         )
         monkeypatch.setattr(
             main, "semantic_search", lambda q, k: fake_response(q, k)["results"]
@@ -61,6 +74,44 @@ def lenient_client(make_client):
         yield c
 
 
+class TestResponseContract:
+    def test_returns_the_documented_shape(self, client):
+        body = client.get("/search", params={"q": "sci-fi", "k": 3}).json()
+
+        assert body["query"] == "sci-fi"
+        assert body["count"] == 3
+        assert len(body["results"]) == 3
+        assert body["timings"]["rerank_ms"] == 3.0
+        assert body["ai_overview"] is None
+
+    def test_reports_whether_reranking_actually_ran(self, client, monkeypatch):
+        """config.reranked keeps the response honest when the reranker is down."""
+        degraded = fake_response("q", 2)
+        degraded["config"]["reranked"] = False
+        for r in degraded["results"]:
+            r.pop("rerank_score")
+        monkeypatch.setattr(main, "hybrid_search", lambda q, k, alpha: degraded)
+
+        body = client.get("/search", params={"q": "x"}).json()
+
+        assert body["config"]["reranked"] is False
+        assert body["results"][0]["rerank_score"] is None
+
+    def test_keyword_search_returns_the_same_result_shape(self, client):
+        body = client.get("/search/keyword", params={"query": "matrix", "k": 2}).json()
+
+        assert body["count"] == 2
+        assert body["results"][0]["id"] == 1
+        assert "title" in body["results"][0]
+
+    def test_openapi_documents_response_schemas(self, client):
+        spec = client.get("/openapi.json").json()
+        schema = spec["paths"]["/search"]["get"]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"]
+        assert "SearchResponse" in schema["$ref"]
+
+
 class TestValidation:
     def test_k_upper_bound_is_enforced(self, client):
         assert client.get("/search", params={"q": "x", "k": 10_000}).status_code == 422
@@ -80,6 +131,44 @@ class TestValidation:
         assert client.get("/search", params={"q": "x", "alpha": 1.5}).status_code == 422
         assert client.get("/search", params={"q": "x", "alpha": -0.1}).status_code == 422
         assert client.get("/search", params={"q": "x", "alpha": 0.0}).status_code == 200
+
+
+class TestStreaming:
+    def test_stream_without_ai_overview_is_rejected(self, client):
+        """Previously this silently returned a plain JSON body."""
+        r = client.get("/search", params={"q": "x", "stream": True})
+        assert r.status_code == 422
+        assert "ai_overview" in r.text
+
+    def test_sse_event_sequence(self, client, monkeypatch):
+        monkeypatch.setattr(
+            main,
+            "generate_ai_overview",
+            lambda q, results: {
+                "overview": "summary",
+                "movie_explanations": [],
+                "ai_metadata": {
+                    "model": "test",
+                    "generation_time_ms": 1.0,
+                    "status": "success",
+                },
+            },
+        )
+
+        r = client.get(
+            "/search", params={"q": "x", "ai_overview": True, "stream": True}
+        )
+
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/event-stream")
+        events = [
+            line.split(": ", 1)[1]
+            for line in r.text.splitlines()
+            if line.startswith("event: ")
+        ]
+        assert events == ["results", "overview", "done"]
+        # Results must precede the overview: that is the point of streaming.
+        assert r.text.index("event: results") < r.text.index("event: overview")
 
 
 class TestRequestIds:

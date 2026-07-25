@@ -9,17 +9,26 @@ import uuid
 from contextlib import asynccontextmanager
 
 import psycopg2
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from api.ratelimit import SlidingWindowRateLimiter, client_key
+from api.schemas import (
+    ErrorResponse,
+    HealthResponse,
+    KeywordSearchResponse,
+    ReadinessResponse,
+    SearchResponse,
+    SemanticSearchResponse,
+)
 from core.ai_overview import generate_ai_overview
 from core.config import (
     AI_OVERVIEW_RATE_LIMIT,
     DEFAULT_TOP_K,
     HYBRID_ALPHA,
     MAX_TOP_K,
+    RERANK_ENABLED,
     candidate_pool_problems,
     get_logger,
     setup_logging,
@@ -94,7 +103,7 @@ async def lifespan(app: FastAPI):
         app.state.startup["database"] = f"error: {e}"
     app.state.startup["database_ms"] = round((time.time() - start) * 1000, 2)
 
-    yield  # Application runs here
+    yield
 
     logger.info("Shutting down Netflix AI Search API...")
     close_pool()
@@ -151,14 +160,10 @@ def _request_id(request: Request) -> str | None:
 def _error_response(
     request: Request, status_code: int, error: str, detail: str | None = None
 ) -> JSONResponse:
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "error": error,
-            "detail": detail,
-            "request_id": _request_id(request),
-        },
-    )
+    body = ErrorResponse(
+        error=error, detail=detail, request_id=_request_id(request)
+    ).model_dump()
+    return JSONResponse(status_code=status_code, content=body)
 
 
 @app.exception_handler(ConfigurationError)
@@ -209,12 +214,18 @@ async def handle_unexpected_error(request: Request, exc: Exception):
     )
 
 
-@app.get("/search/keyword")
-def search_keyword(
-    query: str = Query(..., description="Search query for movie titles")
+# ==============================================================================
+# Search endpoints
+# ==============================================================================
+
+
+@app.get("/search/keyword", response_model=KeywordSearchResponse)
+async def search_keyword(
+    query: str = Query(..., min_length=1, description="Search query for movie titles"),
+    k: int = Query(DEFAULT_TOP_K, ge=1, le=MAX_TOP_K, description="Number of results"),
 ):
-    """Search movies by title keyword."""
-    results = search_movies(query)
+    """Keyword-only search (BM25/full-text) over the movie corpus."""
+    results = await asyncio.to_thread(search_movies, query, k)
     return {
         "query": query,
         "count": len(results),
@@ -222,7 +233,7 @@ def search_keyword(
     }
 
 
-@app.get("/search/semantic")
+@app.get("/search/semantic", response_model=SemanticSearchResponse)
 async def search_semantic_endpoint(
     q: str = Query(..., min_length=1),
     k: int = Query(DEFAULT_TOP_K, ge=1, le=MAX_TOP_K),
@@ -236,7 +247,14 @@ async def search_semantic_endpoint(
     }
 
 
-@app.get("/search")
+@app.get(
+    "/search",
+    response_model=SearchResponse,
+    responses={
+        429: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+)
 async def search_hybrid(
     request: Request,
     q: str = Query(..., min_length=1, description="Search query"),
@@ -252,7 +270,7 @@ async def search_hybrid(
     ),
     stream: bool = Query(
         False,
-        description="Enable SSE streaming (returns results immediately, then AI overview)",
+        description="Enable SSE streaming; requires ai_overview=true",
     ),
 ):
     """
@@ -262,25 +280,32 @@ async def search_hybrid(
 
     1. **Parallel Retrieval**: Vector search + BM25/FTS run simultaneously
     2. **RRF Fusion**: Combine rankings using formula: score = α/(k+rank_vec) + (1-α)/(k+rank_bm25)
-    3. **Cross-Encoder Reranking**: Rerank top candidates for precision
+    3. **Cross-Encoder Reranking**: Rerank top candidates for precision. Best-effort:
+       if the reranker is unavailable the RRF order is returned and
+       `config.reranked` is false.
     4. **AI Overview** (optional): LLM-generated summary explaining why results match
 
     **Alpha parameter controls the blend:**
     - `alpha=0.0`: Pure keyword search (BM25)
-    - `alpha=0.5`: Balanced hybrid (default)
+    - `alpha=0.5`: Balanced hybrid
     - `alpha=1.0`: Pure semantic search (vector)
 
     **AI Overview:**
-    - `ai_overview=true`: Generates an AI summary of results using Ollama
-    - Uses qwen2.5:7b model for fast, accurate explanations
+    - `ai_overview=true`: Generates an AI summary of the top results
+    - Rate limited per client, since generation is a paid upstream call
 
     **Streaming (SSE):**
-    - `stream=true`: Returns Server-Sent Events (SSE) stream
+    - `stream=true`: Returns Server-Sent Events (SSE); requires `ai_overview=true`
     - Events: `results` (search results), `overview` (AI summary), `done` (stream complete)
-    - Client receives results immediately while AI overview generates in background
-
-    Returns query, config, timings, retrieval stats, ranked results, and optional AI overview.
+    - Client receives results immediately while the AI overview generates
     """
+    if stream and not ai_overview:
+        raise HTTPException(
+            status_code=422,
+            detail="stream=true requires ai_overview=true; there is nothing to "
+            "stream without the AI overview.",
+        )
+
     if ai_overview and not _ai_overview_limiter.allow(client_key(request)):
         retry_after = _ai_overview_limiter.retry_after(client_key(request))
         logger.warning(
@@ -290,11 +315,11 @@ async def search_hybrid(
         )
         return JSONResponse(
             status_code=429,
-            content={
-                "error": "rate_limited",
-                "detail": f"AI overview limit reached. Retry in {retry_after}s.",
-                "request_id": _request_id(request),
-            },
+            content=ErrorResponse(
+                error="rate_limited",
+                detail=f"AI overview limit reached. Retry in {retry_after}s.",
+                request_id=_request_id(request),
+            ).model_dump(),
             headers={"Retry-After": str(retry_after)},
         )
 
@@ -302,7 +327,7 @@ async def search_hybrid(
     response = await asyncio.to_thread(hybrid_search, q, k, alpha)
 
     # Streaming mode: return SSE stream
-    if stream and ai_overview:
+    if stream:
 
         async def event_stream():
             # Event 1: Send search results immediately
@@ -311,7 +336,6 @@ async def search_hybrid(
             # Event 2: Generate AI overview asynchronously in background
             if response.get("results"):
                 try:
-                    # Run AI overview generation in thread pool (non-blocking)
                     overview_result = await asyncio.to_thread(
                         generate_ai_overview, q, response["results"]
                     )
@@ -335,21 +359,25 @@ async def search_hybrid(
 
     # Non-streaming mode: return regular JSON response
     if ai_overview and response.get("results"):
-        overview_result = await asyncio.to_thread(
+        response["ai_overview"] = await asyncio.to_thread(
             generate_ai_overview, q, response["results"]
         )
-        response["ai_overview"] = overview_result
 
     return response
 
 
-@app.get("/health")
+# ==============================================================================
+# Probes
+# ==============================================================================
+
+
+@app.get("/health", response_model=HealthResponse)
 def health_check():
     """Liveness check: the process is up and serving. Deliberately cheap."""
     return {"status": "healthy"}
 
 
-@app.get("/ready")
+@app.get("/ready", response_model=ReadinessResponse, responses={503: {"model": ReadinessResponse}})
 async def readiness_check():
     """
     Readiness check: confirms the service can actually serve a search.
@@ -360,15 +388,16 @@ async def readiness_check():
     db_ok = await asyncio.to_thread(ping)
     client_ok = is_client_loaded()
 
-    checks = {k: str(v) for k, v in getattr(app.state, "startup", {}).items()}
+    checks = {
+        k: str(v) for k, v in getattr(app.state, "startup", {}).items()
+    }
 
     ready = db_ok and client_ok
-    return JSONResponse(
-        status_code=200 if ready else 503,
-        content={
-            "status": "ready" if ready else "not_ready",
-            "database": db_ok,
-            "embedding_client": client_ok,
-            "checks": checks,
-        },
-    )
+    body = {
+        "status": "ready" if ready else "not_ready",
+        "database": db_ok,
+        "embedding_client": client_ok,
+        "rerank_enabled": RERANK_ENABLED,
+        "checks": checks,
+    }
+    return JSONResponse(status_code=200 if ready else 503, content=body)
