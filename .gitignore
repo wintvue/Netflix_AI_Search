@@ -32,3 +32,9 @@ Thumbs.db
 *.db
 *.sqlite3
 
+
+# Packaging / test artifacts
+*.egg-info/
+build/
+dist/
+.pytest_cache/

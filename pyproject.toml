@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netflix-ai-search"
+version = "2.0.0"
+description = "Hybrid movie search over Postgres + pgvector with RRF fusion and LLM overviews"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.5.0",
+    "psycopg2-binary>=2.9.9",
+    "pgvector>=0.2.5",
+    "numpy>=1.24.0",
+    "python-dotenv>=1.0.0",
+    "huggingface_hub>=0.30.0",
+    "ollama>=0.4.0",
+]
+
+[project.optional-dependencies]
+# Corpus seeding embeds locally; the web service never imports this.
+seed = ["sentence-transformers>=3.0.0"]
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+movie-search = "cli.keyword_search_cli:main"
+
+[tool.setuptools]
+packages = ["api", "cli", "core"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

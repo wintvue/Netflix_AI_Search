@@ -1,9 +1,16 @@
+# Runtime dependencies for the web service.
+# Kept in sync with [project.dependencies] in pyproject.toml for platforms
+# (Render) that build from a requirements file.
+#
+# Seeding dependencies live in the `seed` extra instead, so the web dyno does
+# not install an ML stack it never imports.
+
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
-psycopg[binary]>=3.1.0
+pydantic>=2.5.0
+psycopg2-binary>=2.9.9
+pgvector>=0.2.5
 numpy>=1.24.0
 python-dotenv>=1.0.0
-psycopg2-binary
-pgvector
+huggingface_hub>=0.30.0
 ollama>=0.4.0
-huggingface_hub

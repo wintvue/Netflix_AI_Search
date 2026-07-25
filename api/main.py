@@ -4,17 +4,26 @@
 import asyncio
 import json
 import os
-import sys
 import time
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
+from core.ai_overview import generate_ai_overview
+from core.config import (
+    DEFAULT_TOP_K,
+    HYBRID_ALPHA,
+    MAX_TOP_K,
+    candidate_pool_problems,
+    get_logger,
+)
+from core.database import close_pool, create_db_pool
+from core.model import get_huggingface_client
+from core.search import hybrid_search, search_movies, semantic_search
+
+logger = get_logger(__name__)
 
 
 def get_cors_origins() -> list[str]:
@@ -40,33 +49,24 @@ def get_cors_origins() -> list[str]:
     return origins
 
 
-from core.ai_overview import generate_ai_overview
-from core.config import DEFAULT_TOP_K, HYBRID_ALPHA, get_logger
-from core.search import hybrid_search, search_movies, semantic_search
-from core.database import create_db_pool, close_connection
-from core.model import get_huggingface_client
-
-logger = get_logger(__name__)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     Application lifespan manager.
 
-    Preloads all ML models at startup so the first request is fast.
+    Preloads shared clients at startup so the first request is fast.
     """
-    # Startup: Load all models
     logger.info("Starting Netflix AI Search API...")
-    # load_times = preload_models()
+
+    for problem in candidate_pool_problems():
+        logger.warning("Configuration | %s", problem)
+
     get_huggingface_client()
     create_db_pool()
     yield  # Application runs here
 
-    # Shutdown: Cleanup if needed
     logger.info("Shutting down Netflix AI Search API...")
-    close_connection()
-    logger.info("Database connection closed.")
+    close_pool()
 
 
 app = FastAPI(
@@ -117,7 +117,7 @@ def search_keyword(
 @app.get("/search/semantic")
 def search_semantic_endpoint(
     q: str = Query(..., min_length=1),
-    k: int = DEFAULT_TOP_K,
+    k: int = Query(DEFAULT_TOP_K, ge=1, le=MAX_TOP_K),
 ):
     """Search movies using semantic similarity (vector search only)."""
     results = semantic_search(q, k)
@@ -131,7 +131,7 @@ def search_semantic_endpoint(
 @app.get("/search")
 async def search_hybrid(
     q: str = Query(..., min_length=1, description="Search query"),
-    k: int = Query(DEFAULT_TOP_K, ge=1, le=100, description="Number of results"),
+    k: int = Query(DEFAULT_TOP_K, ge=1, le=MAX_TOP_K, description="Number of results"),
     alpha: float = Query(
         HYBRID_ALPHA,
         ge=0.0,
