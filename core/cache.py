@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""A small thread-safe TTL cache.
+"""A small TTL cache.
 
 `functools.lru_cache` covers the embedding cache, but search responses need
 entries to expire so the API reflects reseeded data within a bounded delay.
+
+No lock. Every mutation below is a single OrderedDict operation, which the GIL
+makes atomic, and the multi-step paths (expire-then-delete, insert-then-evict)
+are written to tolerate a concurrent thread having already done the step. The
+worst a race costs is a redundant miss or a slightly early eviction.
 """
 
-import threading
 import time
 from collections import OrderedDict
 from typing import Any
@@ -18,7 +22,8 @@ class TTLCache:
         self._maxsize = max(0, maxsize)
         self._ttl = ttl_seconds
         self._entries: OrderedDict[Any, tuple[float, Any]] = OrderedDict()
-        self._lock = threading.Lock()
+        # Plain ints: `+= 1` can lose an update under concurrency, which is
+        # acceptable for hit-rate reporting and not worth serializing lookups.
         self.hits = 0
         self.misses = 0
 
@@ -31,42 +36,49 @@ class TTLCache:
         if not self.enabled:
             return None
 
-        with self._lock:
-            entry = self._entries.get(key)
-            if entry is None:
-                self.misses += 1
-                return None
+        entry = self._entries.get(key)
+        if entry is None:
+            self.misses += 1
+            return None
 
-            expires_at, value = entry
-            if expires_at < time.monotonic():
-                del self._entries[key]
-                self.misses += 1
-                return None
+        expires_at, value = entry
+        if expires_at < time.monotonic():
+            # pop, not del: another thread may have expired or evicted it first.
+            self._entries.pop(key, None)
+            self.misses += 1
+            return None
 
-            self._entries.move_to_end(key)
-            self.hits += 1
-            return value
+        self._touch(key)
+        self.hits += 1
+        return value
 
     def set(self, key: Any, value: Any) -> None:
         if not self.enabled:
             return
 
-        with self._lock:
-            self._entries[key] = (time.monotonic() + self._ttl, value)
-            self._entries.move_to_end(key)
-            while len(self._entries) > self._maxsize:
+        self._entries[key] = (time.monotonic() + self._ttl, value)
+        self._touch(key)
+        while len(self._entries) > self._maxsize:
+            try:
                 self._entries.popitem(last=False)
+            except KeyError:  # another thread drained it first
+                break
+
+    def _touch(self, key: Any) -> None:
+        """Mark `key` most-recently-used, tolerating a concurrent eviction."""
+        try:
+            self._entries.move_to_end(key)
+        except KeyError:
+            pass
 
     def clear(self) -> None:
-        with self._lock:
-            self._entries.clear()
+        self._entries.clear()
 
     def info(self) -> dict:
-        with self._lock:
-            return {
-                "hits": self.hits,
-                "misses": self.misses,
-                "size": len(self._entries),
-                "maxsize": self._maxsize,
-                "ttl_seconds": self._ttl,
-            }
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "size": len(self._entries),
+            "maxsize": self._maxsize,
+            "ttl_seconds": self._ttl,
+        }

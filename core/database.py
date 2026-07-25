@@ -24,8 +24,9 @@ from core.errors import ConfigurationError
 
 logger = get_logger(__name__)
 
+# Created once at startup and closed once at shutdown, both before any request
+# thread exists, so neither needs a mutex.
 pool: ThreadedConnectionPool | None = None
-_pool_lock = threading.Lock()
 
 # Connections that already have the pgvector typecaster registered.
 # psycopg2's connection is a C type with no __dict__, so the flag cannot live on
@@ -52,34 +53,31 @@ def create_db_pool() -> ThreadedConnectionPool:
     if pool is not None:
         return pool
 
-    with _pool_lock:
-        if pool is None:
-            missing = missing_db_settings()
-            if missing:
-                raise ConfigurationError(
-                    f"Missing database settings: {', '.join(missing)}. "
-                    "See .env.example."
-                )
+    missing = missing_db_settings()
+    if missing:
+        raise ConfigurationError(
+            f"Missing database settings: {', '.join(missing)}. See .env.example."
+        )
 
-            logger.info(
-                "Creating database connection pool (min=%d, max=%d) to %s:%s/%s",
-                DB_POOL_MIN,
-                DB_POOL_MAX,
-                DB_HOST,
-                DB_PORT,
-                DB_NAME,
-            )
-            pool = ThreadedConnectionPool(
-                minconn=DB_POOL_MIN,
-                maxconn=DB_POOL_MAX,
-                host=DB_HOST,
-                database=DB_NAME,
-                user=DB_USER,
-                password=DB_PASSWORD,
-                port=DB_PORT,
-                connect_timeout=DB_CONNECT_TIMEOUT,
-            )
-            _pool_slots = threading.Semaphore(DB_POOL_MAX)
+    logger.info(
+        "Creating database connection pool (min=%d, max=%d) to %s:%s/%s",
+        DB_POOL_MIN,
+        DB_POOL_MAX,
+        DB_HOST,
+        DB_PORT,
+        DB_NAME,
+    )
+    pool = ThreadedConnectionPool(
+        minconn=DB_POOL_MIN,
+        maxconn=DB_POOL_MAX,
+        host=DB_HOST,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        port=DB_PORT,
+        connect_timeout=DB_CONNECT_TIMEOUT,
+    )
+    _pool_slots = threading.Semaphore(DB_POOL_MAX)
     return pool
 
 
@@ -144,13 +142,12 @@ def connection():
 def close_pool() -> None:
     """Close every pooled connection. Safe to call more than once."""
     global pool, _pool_slots
-    with _pool_lock:
-        if pool is not None:
-            pool.closeall()
-            pool = None
-            _pgvector_registered.clear()
-            _pool_slots = None
-            logger.info("Database connection pool closed")
+    if pool is not None:
+        pool.closeall()
+        pool = None
+        _pgvector_registered.clear()
+        _pool_slots = None
+        logger.info("Database connection pool closed")
 
 
 def ping() -> bool:
