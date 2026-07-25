@@ -10,5 +10,9 @@ class SearchBackendError(Exception):
     """Base class for failures in a dependency the search pipeline needs."""
 
 
+class EmbeddingError(SearchBackendError):
+    """The query could not be embedded (upstream down, timeout, bad token)."""
+
+
 class ConfigurationError(SearchBackendError):
     """A required setting is missing or invalid."""

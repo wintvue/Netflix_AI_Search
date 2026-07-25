@@ -2,25 +2,28 @@
 """AI Overview generation using Ollama."""
 
 import json
-import os
 import re
+import threading
 import time
 from typing import Literal, TypedDict
 
 from ollama import Client
 
-from core.config import get_logger
+from core.config import (
+    AI_OVERVIEW_MAX_MOVIES,
+    OLLAMA_API_KEY,
+    OLLAMA_HOST,
+    OLLAMA_KEEP_ALIVE,
+    OLLAMA_MODEL,
+    OLLAMA_TIMEOUT_SECONDS,
+    get_logger,
+)
 
 logger = get_logger(__name__)
 
-# Configuration
-OLLAMA_MODEL = "ministral-3:8b-cloud"
-OLLAMA_KEEP_ALIVE = "10m"
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "https://ollama.com")
-OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
-
 # Singleton client
 _ollama_client: Client | None = None
+_client_lock = threading.Lock()
 
 # Status type
 Status = Literal["success", "parse_error", "error", "no_results"]
@@ -29,9 +32,21 @@ Status = Literal["success", "parse_error", "error", "no_results"]
 def get_ollama_client() -> Client:
     """Get or create the Ollama client instance."""
     global _ollama_client
-    if _ollama_client is None:
-        headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
-        _ollama_client = Client(host=OLLAMA_HOST, headers=headers or None)
+    if _ollama_client is not None:
+        return _ollama_client
+
+    with _client_lock:
+        if _ollama_client is None:
+            headers = (
+                {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
+            )
+            # Without a timeout a stalled generation pins a worker thread for
+            # as long as the socket stays open.
+            _ollama_client = Client(
+                host=OLLAMA_HOST,
+                headers=headers or None,
+                timeout=OLLAMA_TIMEOUT_SECONDS,
+            )
     return _ollama_client
 
 
@@ -128,11 +143,21 @@ _MOVIE_FIELDS = [
 ]
 
 
-def format_movies_context(query: str, movies: list[dict]) -> str:
-    """Format movie results as context for the AI model."""
+def format_movies_context(
+    query: str,
+    movies: list[dict],
+    max_movies: int = AI_OVERVIEW_MAX_MOVIES,
+) -> str:
+    """
+    Format movie results as context for the AI model.
+
+    Only the top `max_movies` are included: every movie inlines its full
+    overview text and costs input tokens, and a reader consumes the top of the
+    summary rather than all of a hundred-result page.
+    """
     lines = [f"User Query: {query}", "", "Search Results:"]
-    
-    for i, movie in enumerate(movies, 1):
+
+    for i, movie in enumerate(movies[:max_movies], 1):
         lines.append(f"\n{i}. Movie ID: {movie.get('id')}")
         lines.append(f"   Title: {movie.get('title', 'Unknown')}")
         
@@ -171,10 +196,15 @@ def generate_ai_overview(
             status="no_results",
         )
     
-    logger.info(f"AI Overview | Query: '{query}' | Movies: {len(movies)} | Model: {model}")
-    context = format_movies_context(query, movies)
+    summarized = movies[:AI_OVERVIEW_MAX_MOVIES]
+    logger.info(
+        f"AI Overview | Query: '{query}' | Movies: {len(summarized)}"
+        f"/{len(movies)} | Model: {model}"
+    )
+    context = format_movies_context(query, summarized)
     start = time.time()
-    
+    raw_content = ""
+
     try:
         response = get_ollama_client().chat(
             model=model,
@@ -234,6 +264,10 @@ def generate_ai_overview(
 
 
 if __name__ == "__main__":
+    from core.config import setup_logging
+
+    setup_logging()
+
     test_movies = [
         {
             "id": 1,
