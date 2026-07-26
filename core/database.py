@@ -2,6 +2,7 @@
 """Database connection pooling with pgvector support."""
 
 import threading
+import weakref
 from contextlib import contextmanager
 
 from pgvector.psycopg2 import register_vector
@@ -25,6 +26,14 @@ logger = get_logger(__name__)
 
 pool: ThreadedConnectionPool | None = None
 _pool_lock = threading.Lock()
+
+# Connections that already have the pgvector typecaster registered.
+# psycopg2's connection is a C type with no __dict__, so the flag cannot live on
+# the object itself; and a set of id(conn) values would be unsound because
+# CPython recycles object ids, letting a fresh connection inherit a closed one's
+# id and skip registration. A WeakSet keys on identity and drops entries when the
+# connection is collected, which gets both right.
+_pgvector_registered: weakref.WeakSet = weakref.WeakSet()
 
 
 def create_db_pool() -> ThreadedConnectionPool:
@@ -78,16 +87,15 @@ def get_connection():
 
     conn = pool.getconn()
 
-    # Track registration on the connection object itself. Keying a set on
-    # id(conn) would be wrong: CPython recycles object ids, so a new connection
-    # could inherit a closed one's id and skip pgvector registration.
-    if not getattr(conn, "_pgvector_registered", False):
+    # No lock here: register_vector does a round trip to look up the vector OID,
+    # and registering twice is harmless, so a race costs one redundant query.
+    if conn not in _pgvector_registered:
         try:
             register_vector(conn)
         except Exception:
             put_connection(conn, close=True)
             raise
-        conn._pgvector_registered = True
+        _pgvector_registered.add(conn)
 
     return conn
 
@@ -116,4 +124,5 @@ def close_pool() -> None:
         if pool is not None:
             pool.closeall()
             pool = None
+            _pgvector_registered.clear()
             logger.info("Database connection pool closed")
