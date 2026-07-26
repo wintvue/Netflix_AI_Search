@@ -207,8 +207,30 @@ class TestParseRerankResponse:
         body = [{"label": "LABEL_0", "score": 0.55}]
         assert model._parse_rerank_response(body, expected=1) == [0.55]
 
+    def test_batch_wrapped_in_one_outer_list(self):
+        """
+        The live shape from hf-inference for BAAI/bge-reranker-base: the whole
+        batch arrives as a single inner list, one dict per pair.
+        """
+        body = [
+            [
+                {"label": "LABEL_0", "score": 0.0005809},
+                {"label": "LABEL_0", "score": 0.0000721},
+                {"label": "LABEL_0", "score": 0.0000373},
+            ]
+        ]
+        assert model._parse_rerank_response(body, expected=3) == [
+            0.0005809,
+            0.0000721,
+            0.0000373,
+        ]
+
+    def test_a_one_pair_batch_is_read_the_same_either_way(self):
+        body = [[{"label": "LABEL_0", "score": 0.42}]]
+        assert model._parse_rerank_response(body, expected=1) == [0.42]
+
     def test_wrong_length_is_an_error(self):
-        with pytest.raises(RerankError, match="Unexpected rerank response shape"):
+        with pytest.raises(RerankError, match="predictions for 3 inputs"):
             model._parse_rerank_response([[{"label": "a", "score": 1.0}]], expected=3)
 
     def test_non_list_body_is_an_error(self):

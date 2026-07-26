@@ -190,12 +190,28 @@ def _parse_rerank_response(body, expected: int) -> list[float]:
     """
     Pull one relevance score per input out of a text-classification response.
 
-    The endpoint returns a list of label/score lists, one per input pair. For a
-    single-label reranker that is one entry; for a two-label model the positive
-    class is the one to keep.
+    Two shapes occur in practice. Standard text-classification returns one list
+    of label/score dicts per input pair. The hf-inference router serving
+    BAAI/bge-reranker-base instead wraps the whole batch in a single extra list
+    -- `[[{...}, {...}, ...]]`, one dict per pair, in input order -- so unwrap
+    that before scoring. For a two-label model the positive class is the one to
+    keep; single-label rerankers emit just the relevance score.
     """
-    if not isinstance(body, list) or len(body) != expected:
+    if not isinstance(body, list):
         raise RerankError(f"Unexpected rerank response shape: {type(body).__name__}")
+
+    if (
+        len(body) == 1
+        and expected != 1
+        and isinstance(body[0], list)
+        and len(body[0]) == expected
+    ):
+        body = body[0]
+
+    if len(body) != expected:
+        raise RerankError(
+            f"Rerank returned {len(body)} predictions for {expected} inputs"
+        )
 
     scores: list[float] = []
     for entry in body:
