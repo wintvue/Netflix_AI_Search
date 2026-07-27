@@ -10,34 +10,39 @@ This implements the industry-standard hybrid search approach used by:
 
 The pipeline:
 1. Parallel Retrieval: Vector search + BM25/FTS search run simultaneously
-2. Score Normalization: Min-max normalization per retrieval method
-3. Reciprocal Rank Fusion: RRF formula combines rankings
-4. Cross-Encoder Reranking: Final precision boost on top candidates
+2. Reciprocal Rank Fusion: RRF combines the two rankings by rank position
+3. Cross-Encoder Reranking: best-effort precision boost on the top candidates
 """
 
+import copy
 import json
 import logging
 import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TypedDict
 
 import numpy as np
 import psycopg2.extras
 
+from core.cache import TTLCache
 from core.config import (
     BM25_CANDIDATES,
     DEFAULT_TOP_K,
     HYBRID_ALPHA,
     RERANK_CANDIDATES,
+    RERANK_ENABLED,
     RRF_K,
+    SEARCH_CACHE_SIZE,
+    SEARCH_CACHE_TTL_SECONDS,
     VECTOR_CANDIDATES,
     get_logger,
 )
 from core.database import connection
-from core.model import encode_query
+from core.errors import RerankError
+from core.model import encode_query, rerank
 
 logger = get_logger(__name__)
+
+_search_cache = TTLCache(SEARCH_CACHE_SIZE, SEARCH_CACHE_TTL_SECONDS)
 
 
 # ==============================================================================
@@ -99,12 +104,6 @@ LIMIT %s;
 # ==============================================================================
 
 
-class Movie(TypedDict):
-    id: int
-    title: str
-    description: str
-
-
 @dataclass
 class RetrievalResult:
     """Result from a single retrieval method."""
@@ -122,6 +121,36 @@ class FusedResult:
     rrf_score: float
     vector_rank: int | None
     bm25_rank: int | None
+
+
+@dataclass
+class RetrievalOutput:
+    """Output from the retrieval stage."""
+
+    vector_results: list[RetrievalResult]
+    bm25_results: list[RetrievalResult]
+    movie_rows: dict[int, dict]
+    elapsed_ms: float
+
+
+@dataclass
+class FusionOutput:
+    """Output from the RRF fusion stage."""
+
+    fused_results: list[FusedResult]
+    candidates: list[FusedResult]
+    candidate_ids: list[int]
+    elapsed_ms: float
+
+
+@dataclass
+class RerankOutput:
+    """Output from the reranking stage."""
+
+    candidate_ids: list[int]
+    scores: dict[int, float]
+    applied: bool
+    elapsed_ms: float
 
 
 # ==============================================================================
@@ -144,28 +173,6 @@ def _debug_enabled() -> bool:
     return logger.isEnabledFor(logging.DEBUG)
 
 
-def normalize_scores(results: list[RetrievalResult]) -> list[RetrievalResult]:
-    """
-    Min-max normalize scores to [0, 1] range.
-
-    This ensures scores from different retrieval methods are comparable.
-    """
-    if not results:
-        return results
-
-    scores = [r.score for r in results]
-    min_score, max_score = min(scores), max(scores)
-
-    if max_score == min_score:
-        # All scores are the same, set to 1.0
-        return [RetrievalResult(r.id, 1.0, r.rank) for r in results]
-
-    return [
-        RetrievalResult(r.id, (r.score - min_score) / (max_score - min_score), r.rank)
-        for r in results
-    ]
-
-
 def compute_rrf(
     vector_results: list[RetrievalResult],
     bm25_results: list[RetrievalResult],
@@ -177,6 +184,9 @@ def compute_rrf(
 
     RRF Formula: score = α * 1/(k + rank_vector) + (1-α) * 1/(k + rank_bm25)
 
+    RRF consumes rank positions only, never the raw retrieval scores, which is
+    exactly what makes it robust to two retrievers on incomparable scales.
+
     Args:
         vector_results: Results from vector search (semantic)
         bm25_results: Results from BM25/FTS search (keyword)
@@ -186,37 +196,32 @@ def compute_rrf(
     Returns:
         Fused results sorted by RRF score descending
     """
-    # Build rank maps
     vector_ranks = {r.id: r.rank for r in vector_results}
     bm25_ranks = {r.id: r.rank for r in bm25_results}
 
-    # Get all unique IDs
-    all_ids = set(vector_ranks.keys()) | set(bm25_ranks.keys())
+    all_ids = set(vector_ranks) | set(bm25_ranks)
 
     fused = []
     for doc_id in all_ids:
         vec_rank = vector_ranks.get(doc_id)
         bm25_rank = bm25_ranks.get(doc_id)
 
-        # Compute RRF score
         vec_rrf = alpha * (1.0 / (k + vec_rank)) if vec_rank is not None else 0.0
         bm25_rrf = (
             (1 - alpha) * (1.0 / (k + bm25_rank)) if bm25_rank is not None else 0.0
         )
 
-        rrf_score = vec_rrf + bm25_rrf
-
         fused.append(
             FusedResult(
                 id=doc_id,
-                rrf_score=rrf_score,
+                rrf_score=vec_rrf + bm25_rrf,
                 vector_rank=vec_rank,
                 bm25_rank=bm25_rank,
             )
         )
 
-    # Sort by RRF score descending
-    fused.sort(key=lambda x: x.rrf_score, reverse=True)
+    # Sort by score, breaking ties on id so the ordering is deterministic.
+    fused.sort(key=lambda x: (-x.rrf_score, x.id))
     return fused
 
 
@@ -229,30 +234,6 @@ def build_rerank_text(movie: dict) -> str:
         f"Overview: {movie.get('overview') or ''}",
     ]
     return "\n".join(p for p in parts if not p.endswith(": "))
-
-
-# ==============================================================================
-# Legacy Keyword Search (from JSON file)
-# ==============================================================================
-
-DATA_PATH = Path(__file__).parent.parent / "data" / "movies.json"
-with open(DATA_PATH) as f:
-    _MOVIES_DATA = json.load(f)
-
-
-def search_movies(query: str) -> list[Movie]:
-    """Search movies by title keyword (legacy JSON-based search)."""
-    logger.info(f"Keyword search | Query: '{query}'")
-
-    query_lower = query.lower()
-    results: list[Movie] = [
-        movie
-        for movie in _MOVIES_DATA["movies"]
-        if query_lower in movie["title"].lower()
-    ]
-
-    logger.info(f"Keyword search | Found: {len(results)} results")
-    return results
 
 
 # ==============================================================================
@@ -271,14 +252,12 @@ def semantic_search(query: str, top_k: int = DEFAULT_TOP_K) -> list[dict]:
     Returns:
         List of movies ranked by semantic similarity
     """
-    logger.info(f"Semantic search | Query: '{query}' | Top-K: {top_k}")
+    logger.info("Semantic search | Query: '%s' | Top-K: %d", query, top_k)
 
-    # Encode query
     start = time.time()
     q_emb = encode_query(query)
     encode_time = (time.time() - start) * 1000
 
-    # Database search
     start = time.time()
     with connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -318,30 +297,7 @@ def semantic_search(query: str, top_k: int = DEFAULT_TOP_K) -> list[dict]:
 # ==============================================================================
 
 
-@dataclass
-class RetrievalOutput:
-    """Output from the retrieval stage."""
-
-    vector_results: list[RetrievalResult]
-    bm25_results: list[RetrievalResult]
-    movie_rows: dict[int, dict]
-    elapsed_ms: float
-
-
-@dataclass
-class FusionOutput:
-    """Output from the RRF fusion stage."""
-
-    fused_results: list[FusedResult]
-    candidates: list[FusedResult]
-    candidate_ids: list[int]
-    elapsed_ms: float
-
-
-def _retrieve_candidates(
-    query: str,
-    query_embedding: np.ndarray,
-) -> RetrievalOutput:
+def _retrieve_candidates(query: str, query_embedding: np.ndarray) -> RetrievalOutput:
     """
     Stage 2: Parallel retrieval using Vector search and BM25/FTS.
 
@@ -356,36 +312,30 @@ def _retrieve_candidates(
 
     with connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Vector search
             cur.execute(
-                SQL_VECTOR_SEARCH, (query_embedding, query_embedding, VECTOR_CANDIDATES)
+                SQL_VECTOR_SEARCH,
+                (query_embedding, query_embedding, VECTOR_CANDIDATES),
             )
             for rank, row in enumerate(cur.fetchall(), start=1):
                 row_dict = dict(row)
                 movie_id = int(row_dict["id"])
                 vector_results.append(
                     RetrievalResult(
-                        id=movie_id,
-                        score=float(row_dict["score"]),
-                        rank=rank,
+                        id=movie_id, score=float(row_dict["score"]), rank=rank
                     )
                 )
                 movie_rows[movie_id] = row_dict
 
-            # BM25/FTS search
             cur.execute(SQL_BM25_SEARCH, (query, query, BM25_CANDIDATES))
             for rank, row in enumerate(cur.fetchall(), start=1):
                 row_dict = dict(row)
                 movie_id = int(row_dict["id"])
                 bm25_results.append(
                     RetrievalResult(
-                        id=movie_id,
-                        score=float(row_dict["score"]),
-                        rank=rank,
+                        id=movie_id, score=float(row_dict["score"]), rank=rank
                     )
                 )
-                if movie_id not in movie_rows:
-                    movie_rows[movie_id] = row_dict
+                movie_rows.setdefault(movie_id, row_dict)
 
     elapsed_ms = (time.time() - start) * 1000
 
@@ -430,20 +380,11 @@ def _fuse_with_rrf(
 ) -> FusionOutput:
     """
     Stage 3: Reciprocal Rank Fusion (RRF) to combine rankings.
-
-    Normalizes scores from both retrieval methods, then applies RRF
-    to produce a unified ranking.
     """
     start = time.time()
 
-    # Normalize scores for comparability
-    vector_norm = normalize_scores(vector_results)
-    bm25_norm = normalize_scores(bm25_results)
+    fused_results = compute_rrf(vector_results, bm25_results, k=RRF_K, alpha=alpha)
 
-    # Compute RRF fusion
-    fused_results = compute_rrf(vector_norm, bm25_norm, k=RRF_K, alpha=alpha)
-
-    # Take top candidates for reranking
     candidates = fused_results[:RERANK_CANDIDATES]
     candidate_ids = [c.id for c in candidates]
 
@@ -476,28 +417,90 @@ def _fuse_with_rrf(
     )
 
 
+def _rerank_candidates(
+    query: str,
+    candidate_ids: list[int],
+    movie_rows: dict[int, dict],
+) -> RerankOutput:
+    """
+    Stage 4: Cross-encoder reranking for precision.
+
+    Best-effort by design: reranking is an external call, and a search that
+    returns RRF-ordered results beats one that returns an error, so any failure
+    falls back to the incoming order.
+    """
+    start = time.time()
+
+    if not RERANK_ENABLED or not candidate_ids:
+        return RerankOutput(
+            candidate_ids=candidate_ids,
+            scores={},
+            applied=False,
+            elapsed_ms=(time.time() - start) * 1000,
+        )
+
+    documents = [build_rerank_text(movie_rows[cid]) for cid in candidate_ids]
+
+    try:
+        scores = rerank(query, documents)
+    except RerankError as e:
+        logger.warning("Rerank | Falling back to RRF order: %s", e)
+        return RerankOutput(
+            candidate_ids=candidate_ids,
+            scores={},
+            applied=False,
+            elapsed_ms=(time.time() - start) * 1000,
+        )
+
+    score_map = dict(zip(candidate_ids, scores))
+    reranked_ids = sorted(candidate_ids, key=lambda cid: (-score_map[cid], cid))
+
+    elapsed_ms = (time.time() - start) * 1000
+    logger.info("Rerank | %.2fms | Candidates: %d", elapsed_ms, len(candidate_ids))
+
+    return RerankOutput(
+        candidate_ids=reranked_ids,
+        scores=score_map,
+        applied=True,
+        elapsed_ms=elapsed_ms,
+    )
+
+
 def _build_final_results(
     candidate_ids: list[int],
     candidates: list[FusedResult],
     movie_rows: dict[int, dict],
+    rerank_scores: dict[int, float],
     top_k: int,
 ) -> list[dict]:
     """
-    Stage 4: Build final result list with RRF metadata.
-
-    Attaches RRF scores and rank information to movie results.
+    Stage 5: Build the final result list with fusion and rerank metadata.
     """
-    # Get movies in candidate order
-    results = [movie_rows[cid] for cid in candidate_ids if cid in movie_rows][:top_k]
-
-    # Add RRF metadata
     rrf_map = {c.id: c for c in candidates}
-    for r in results:
-        fused = rrf_map.get(r["id"])
+
+    results = []
+    for cid in candidate_ids[:top_k]:
+        row = movie_rows.get(cid)
+        if row is None:
+            continue
+
+        # Copy: movie_rows entries are shared with the caller's retrieval
+        # output, and cached responses must not alias mutable state.
+        result = dict(row)
+
+        # `score` means different things depending on which retriever surfaced
+        # the row first, so drop it rather than emit an ambiguous field.
+        result.pop("score", None)
+
+        fused = rrf_map.get(cid)
         if fused:
-            r["rrf_score"] = fused.rrf_score
-            r["vector_rank"] = fused.vector_rank
-            r["bm25_rank"] = fused.bm25_rank
+            result["rrf_score"] = fused.rrf_score
+            result["vector_rank"] = fused.vector_rank
+            result["bm25_rank"] = fused.bm25_rank
+        if cid in rerank_scores:
+            result["rerank_score"] = rerank_scores[cid]
+
+        results.append(result)
 
     return results
 
@@ -515,12 +518,11 @@ def hybrid_search(
     """
     Hybrid search using Reciprocal Rank Fusion (RRF).
 
-    This is the industry-standard approach for combining semantic and keyword search:
-
     1. **Query Encoding**: Convert query to embedding
     2. **Parallel Retrieval**: Run vector search + BM25/FTS
     3. **RRF Fusion**: Combine rankings using Reciprocal Rank Fusion
-    4. **Final Results**: Build response with metadata
+    4. **Reranking**: Cross-encoder pass over the top candidates (best-effort)
+    5. **Final Results**: Build response with metadata
 
     Args:
         query: Natural language search query
@@ -531,6 +533,13 @@ def hybrid_search(
         Dict with query, config, retrieval stats, and ranked results
     """
     query = query.strip()
+
+    cache_key = (query.lower(), top_k, round(alpha, 4))
+    cached = _search_cache.get(cache_key)
+    if cached is not None:
+        logger.info("Hybrid search | Cache hit | Query: '%s'", query)
+        return copy.deepcopy(cached)
+
     logger.info(
         "Hybrid search | Query: '%s' | Top-K: %d | Alpha: %s", query, top_k, alpha
     )
@@ -547,38 +556,28 @@ def hybrid_search(
     timings["retrieval_ms"] = retrieval.elapsed_ms
 
     # Stage 3: RRF Fusion
-    fusion = _fuse_with_rrf(
-        retrieval.vector_results,
-        retrieval.bm25_results,
-        alpha,
-    )
+    fusion = _fuse_with_rrf(retrieval.vector_results, retrieval.bm25_results, alpha)
     timings["fusion_ms"] = fusion.elapsed_ms
 
-    # Early exit if no candidates
-    if not fusion.candidate_ids:
-        return {
-            "query": query,
-            "config": {"alpha": alpha, "rrf_k": RRF_K},
-            "timings": timings,
-            "retrieval": {"vector": 0, "bm25": 0, "fused": 0},
-            "count": 0,
-            "results": [],
-        }
+    # Stage 4: Reranking
+    reranked = _rerank_candidates(query, fusion.candidate_ids, retrieval.movie_rows)
+    timings["rerank_ms"] = reranked.elapsed_ms
 
-    # Stage 4: Build Final Results
+    # Stage 5: Build Final Results
     results = _build_final_results(
-        fusion.candidate_ids,
+        reranked.candidate_ids,
         fusion.candidates,
         retrieval.movie_rows,
+        reranked.scores,
         top_k,
     )
 
-    # Compute total time
     timings["total_ms"] = sum(timings.values())
 
     logger.info(
-        "Hybrid search | Final: %d results | Total: %.2fms",
+        "Hybrid search | Final: %d results | Reranked: %s | Total: %.2fms",
         len(results),
+        reranked.applied,
         timings["total_ms"],
     )
     if _debug_enabled():
@@ -590,6 +589,7 @@ def hybrid_search(
                         "rank": i + 1,
                         "id": r["id"],
                         "title": r["title"],
+                        "rerank_score": r.get("rerank_score"),
                         "rrf_score": round(r.get("rrf_score", 0), 6),
                         "vec_rank": r.get("vector_rank"),
                         "bm25_rank": r.get("bm25_rank"),
@@ -599,7 +599,7 @@ def hybrid_search(
             ),
         )
 
-    return {
+    response = {
         "query": query,
         "config": {
             "alpha": alpha,
@@ -607,6 +607,7 @@ def hybrid_search(
             "vector_candidates": VECTOR_CANDIDATES,
             "bm25_candidates": BM25_CANDIDATES,
             "rerank_candidates": RERANK_CANDIDATES,
+            "reranked": reranked.applied,
         },
         "timings": timings,
         "retrieval": {
@@ -617,6 +618,37 @@ def hybrid_search(
         "count": len(results),
         "results": results,
     }
+
+    _search_cache.set(cache_key, response)
+    return copy.deepcopy(response)
+
+
+# ==============================================================================
+# Keyword Search
+# ==============================================================================
+
+
+def search_movies(query: str, top_k: int = DEFAULT_TOP_K) -> list[dict]:
+    """
+    Keyword-only search over the movie corpus.
+
+    Pure keyword search is hybrid search with alpha=0, so this reuses the same
+    pipeline rather than maintaining a second retrieval path.
+    """
+    logger.info("Keyword search | Query: '%s'", query)
+    response = hybrid_search(query, top_k=top_k, alpha=0.0)
+    logger.info("Keyword search | Found: %d results", response["count"])
+    return response["results"]
+
+
+def search_cache_info() -> dict:
+    """Hit/miss statistics for the search response cache."""
+    return _search_cache.info()
+
+
+def clear_search_cache() -> None:
+    """Drop every cached search response."""
+    _search_cache.clear()
 
 
 # ==============================================================================
@@ -630,33 +662,38 @@ if __name__ == "__main__":
     setup_logging()
     create_db_pool()
 
-    # Test queries
-    queries = [
-        "mind-bending sci-fi thriller",
-        "romantic comedy in Paris",
-        "dark superhero movie",
-    ]
+    try:
+        for q in [
+            "mind-bending sci-fi thriller",
+            "romantic comedy in Paris",
+            "dark superhero movie",
+        ]:
+            print(f"\n{'=' * 80}")
+            print(f"Query: {q}")
+            print("=" * 80)
 
-    for q in queries:
-        print(f"\n{'='*80}")
-        print(f"Query: {q}")
-        print("=" * 80)
+            response = hybrid_search(q, top_k=5)
 
-        response = hybrid_search(q, top_k=5)
-
-        print(
-            f"\nConfig: alpha={response['config']['alpha']}, k={response['config']['rrf_k']}"
-        )
-        print(f"Timings: {response['timings']}")
-        print(f"Retrieval: {response['retrieval']}")
-        print(f"\nResults ({response['count']}):")
-
-        for i, r in enumerate(response["results"], 1):
             print(
-                f"  {i}. {r['title']}"
-                f" | rrf={r.get('rrf_score', 0):.6f}"
-                f" | vec_rank={r.get('vector_rank')}"
-                f" | bm25_rank={r.get('bm25_rank')}"
+                f"\nConfig: alpha={response['config']['alpha']}, "
+                f"k={response['config']['rrf_k']}, "
+                f"reranked={response['config']['reranked']}"
             )
+            print(f"Timings: {response['timings']}")
+            print(f"Retrieval: {response['retrieval']}")
+            print(f"\nResults ({response['count']}):")
 
-    close_pool()
+            for i, r in enumerate(response["results"], 1):
+                rerank_score = r.get("rerank_score")
+                rerank_display = (
+                    f"{rerank_score:.3f}" if rerank_score is not None else "n/a"
+                )
+                print(
+                    f"  {i}. {r['title']}"
+                    f" | rerank={rerank_display}"
+                    f" | rrf={r.get('rrf_score', 0):.6f}"
+                    f" | vec_rank={r.get('vector_rank')}"
+                    f" | bm25_rank={r.get('bm25_rank')}"
+                )
+    finally:
+        close_pool()

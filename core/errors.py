@@ -14,5 +14,9 @@ class EmbeddingError(SearchBackendError):
     """The query could not be embedded (upstream down, timeout, bad token)."""
 
 
+class RerankError(SearchBackendError):
+    """Reranking failed. Callers should fall back to the pre-rerank order."""
+
+
 class ConfigurationError(SearchBackendError):
     """A required setting is missing or invalid."""

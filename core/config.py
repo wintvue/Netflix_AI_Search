@@ -62,6 +62,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = _env(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _legacy_env(name: str, legacy_name: str, default: str | None = None) -> str | None:
     """
     Read `name`, falling back to a legacy variable on developer machines only.
@@ -134,13 +141,38 @@ def missing_db_settings() -> list[str]:
 # ==============================================================================
 
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+# Reranking backend: "hf" calls the hosted Inference API, "local" loads a
+# cross-encoder into this process, "none" disables the stage.
+#
+# The originally-configured cross-encoder/ms-marco-MiniLM-L-6-v2 has been
+# renamed upstream (it now redirects to .../ms-marco-MiniLM-L6-v2) and, more
+# importantly, no inference provider serves it -- its inferenceProviderMapping
+# is empty, so it can only run locally. BAAI/bge-reranker-base is a comparable
+# cross-encoder that *is* live on hf-inference, exposed as text-classification
+# over sentence pairs, so it is the default for the hosted path.
+RERANK_BACKEND = (_env("RERANK_BACKEND", "hf") or "hf").lower()
+RERANK_MODEL_NAME = _env("RERANK_MODEL_NAME", "BAAI/bge-reranker-base")
+RERANK_LOCAL_MODEL_NAME = _env(
+    "RERANK_LOCAL_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L6-v2"
+)
+RERANK_BATCH_SIZE = _env_int("RERANK_BATCH_SIZE", 32)
 
 HF_TOKEN = _env("HF_TOKEN")
+HF_ROUTER_URL = _env("HF_ROUTER_URL", "https://router.huggingface.co/hf-inference")
 
-# Every embedding call is a network round trip; without a timeout a slow
+# Every embedding/rerank call is a network round trip; without a timeout a slow
 # upstream pins a worker thread for as long as the socket stays open.
 HF_TIMEOUT_SECONDS = _env_float("HF_TIMEOUT_SECONDS", 10.0)
+
+# Queries repeat heavily in a search workload, and the embedding is on the
+# critical path before the database is touched.
+EMBED_CACHE_SIZE = _env_int("EMBED_CACHE_SIZE", 512)
+
+# Reranking is the most expensive stage; keep it switchable without a redeploy.
+# It is best-effort: a failure logs and falls back to the RRF order rather than
+# failing the search, so defaulting it on cannot take the endpoint down.
+RERANK_ENABLED = _env_bool("RERANK_ENABLED", True) and RERANK_BACKEND != "none"
 
 
 # ==============================================================================
@@ -158,7 +190,7 @@ MAX_TOP_K = _env_int("MAX_TOP_K", 100)
 VECTOR_CANDIDATES = _env_int("VECTOR_CANDIDATES", 150)
 BM25_CANDIDATES = _env_int("BM25_CANDIDATES", 150)
 
-# Number of fused candidates kept for the final ranking.
+# Number of fused candidates handed to the reranker.
 RERANK_CANDIDATES = _env_int("RERANK_CANDIDATES", 100)
 
 # Reciprocal Rank Fusion (RRF) parameters.
@@ -170,6 +202,10 @@ RRF_K = _env_int("RRF_K", 60)
 # alpha=1.0 -> pure vector, alpha=0.0 -> pure BM25
 # 0.5-0.7 is typical for balanced hybrid search
 HYBRID_ALPHA = _env_float("HYBRID_ALPHA", 0.8)
+
+# Cache of complete search responses, keyed on (query, k, alpha).
+SEARCH_CACHE_SIZE = _env_int("SEARCH_CACHE_SIZE", 256)
+SEARCH_CACHE_TTL_SECONDS = _env_float("SEARCH_CACHE_TTL_SECONDS", 60.0)
 
 
 def candidate_pool_problems() -> list[str]:
@@ -190,7 +226,7 @@ def candidate_pool_problems() -> list[str]:
         problems.append(
             f"VECTOR_CANDIDATES ({VECTOR_CANDIDATES}) and BM25_CANDIDATES "
             f"({BM25_CANDIDATES}) are both below RERANK_CANDIDATES "
-            f"({RERANK_CANDIDATES}): the final ranking will never see a full pool"
+            f"({RERANK_CANDIDATES}): the reranker will never see a full pool"
         )
     return problems
 

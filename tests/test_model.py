@@ -4,13 +4,15 @@ import numpy as np
 import pytest
 
 import core.model as model
-from core.errors import ConfigurationError, EmbeddingError
+from core.errors import ConfigurationError, EmbeddingError, RerankError
 
 
 @pytest.fixture(autouse=True)
 def reset_client(monkeypatch):
     monkeypatch.setattr(model, "_client", None)
+    model._encode_query_cached.cache_clear()
     yield
+    model._encode_query_cached.cache_clear()
 
 
 class TestGetHuggingFaceClient:
@@ -134,3 +136,136 @@ class TestRetryAndErrorWrapping:
         model.get_huggingface_client()
 
         assert captured["timeout"] == model.HF_TIMEOUT_SECONDS
+
+
+class TestEmbeddingCache:
+    def test_repeated_queries_hit_the_cache(self, monkeypatch):
+        """The embedding is a network round trip before the DB is touched."""
+        calls = []
+
+        class Client:
+            def feature_extraction(self, text, **kw):
+                calls.append(text)
+                return [0.1, 0.2, 0.3]
+
+        monkeypatch.setattr(model, "get_huggingface_client", lambda: Client())
+
+        first = model.encode_query("Sci-Fi")
+        second = model.encode_query("  sci-fi  ")
+
+        # Case and surrounding whitespace collapse onto one cache entry.
+        assert calls == ["sci-fi"]
+        assert np.array_equal(first, second)
+
+    def test_cached_arrays_are_read_only(self, monkeypatch):
+        """A caller must not be able to corrupt a shared cache entry."""
+
+        class Client:
+            def feature_extraction(self, text, **kw):
+                return [0.1, 0.2]
+
+        monkeypatch.setattr(model, "get_huggingface_client", lambda: Client())
+
+        embedding = model.encode_query("q")
+
+        with pytest.raises(ValueError):
+            embedding[0] = 99.0
+
+    def test_cache_info_is_reported(self, monkeypatch):
+        class Client:
+            def feature_extraction(self, text, **kw):
+                return [0.1]
+
+        monkeypatch.setattr(model, "get_huggingface_client", lambda: Client())
+
+        model.encode_query("a")
+        model.encode_query("a")
+
+        info = model.embedding_cache_info()
+        assert info["hits"] == 1
+        assert info["misses"] == 1
+
+
+class TestParseRerankResponse:
+    def test_single_label_per_pair(self):
+        body = [
+            [{"label": "LABEL_0", "score": 0.9}],
+            [{"label": "LABEL_0", "score": 0.2}],
+        ]
+        assert model._parse_rerank_response(body, expected=2) == [0.9, 0.2]
+
+    def test_two_label_model_takes_the_positive_class(self):
+        body = [
+            [
+                {"label": "LABEL_0", "score": 0.3},
+                {"label": "LABEL_1", "score": 0.7},
+            ]
+        ]
+        assert model._parse_rerank_response(body, expected=1) == [0.7]
+
+    def test_unwrapped_single_prediction(self):
+        body = [{"label": "LABEL_0", "score": 0.55}]
+        assert model._parse_rerank_response(body, expected=1) == [0.55]
+
+    def test_batch_wrapped_in_one_outer_list(self):
+        """
+        The live shape from hf-inference for BAAI/bge-reranker-base: the whole
+        batch arrives as a single inner list, one dict per pair.
+        """
+        body = [
+            [
+                {"label": "LABEL_0", "score": 0.0005809},
+                {"label": "LABEL_0", "score": 0.0000721},
+                {"label": "LABEL_0", "score": 0.0000373},
+            ]
+        ]
+        assert model._parse_rerank_response(body, expected=3) == [
+            0.0005809,
+            0.0000721,
+            0.0000373,
+        ]
+
+    def test_a_one_pair_batch_is_read_the_same_either_way(self):
+        body = [[{"label": "LABEL_0", "score": 0.42}]]
+        assert model._parse_rerank_response(body, expected=1) == [0.42]
+
+    def test_wrong_length_is_an_error(self):
+        with pytest.raises(RerankError, match="predictions for 3 inputs"):
+            model._parse_rerank_response([[{"label": "a", "score": 1.0}]], expected=3)
+
+    def test_non_list_body_is_an_error(self):
+        """A model-loading error body must not be mistaken for scores."""
+        with pytest.raises(RerankError):
+            model._parse_rerank_response({"error": "model loading"}, expected=1)
+
+    def test_empty_prediction_is_an_error(self):
+        with pytest.raises(RerankError, match="empty prediction"):
+            model._parse_rerank_response([[]], expected=1)
+
+
+class TestRerank:
+    def test_empty_documents_short_circuits(self):
+        assert model.rerank("q", []) == []
+
+    def test_unknown_backend_raises(self, monkeypatch):
+        monkeypatch.setattr(model, "RERANK_BACKEND", "nonsense")
+        with pytest.raises(RerankError, match="Unknown RERANK_BACKEND"):
+            model.rerank("q", ["a"])
+
+    def test_score_count_mismatch_is_detected(self, monkeypatch):
+        monkeypatch.setattr(model, "RERANK_BACKEND", "hf")
+        monkeypatch.setattr(model, "_rerank_hosted", lambda q, docs: [0.5])
+
+        with pytest.raises(RerankError, match="returned 1 scores for 2 documents"):
+            model.rerank("q", ["a", "b"])
+
+    def test_wraps_unexpected_failures(self, monkeypatch):
+        monkeypatch.setattr(model, "RERANK_BACKEND", "hf")
+
+        def boom(q, docs):
+            raise ConnectionError("router down")
+
+        monkeypatch.setattr(model, "_rerank_hosted", boom)
+
+        with pytest.raises(RerankError, match="Reranking failed"):
+            model.rerank("q", ["a"])
