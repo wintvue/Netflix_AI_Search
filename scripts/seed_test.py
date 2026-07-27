@@ -1,18 +1,21 @@
-import os
 import numpy as np
 import psycopg2
 import psycopg2.extras
 from sentence_transformers import SentenceTransformer
-from dotenv import load_dotenv
+
 # IMPORTANT: enables psycopg2 adaptation for pgvector type
 from pgvector.psycopg2 import register_vector
 
-load_dotenv()
-USER = os.getenv("DB_USER")
-PASSWORD = os.getenv("DB_PASSWORD")
-HOST = os.getenv("HOST")
-PORT = os.getenv("PORT")
-DBNAME = os.getenv("DB_NAME")
+# Database settings come from core.config so these scripts cannot drift from
+# the application -- in particular DB_PORT, which must not fall back to the
+# platform-injected PORT of the web listener.
+from core.config import DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER
+
+USER = DB_USER
+PASSWORD = DB_PASSWORD
+HOST = DB_HOST
+PORT = DB_PORT
+DBNAME = DB_NAME
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # 384 dims
 
 

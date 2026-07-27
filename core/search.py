@@ -582,6 +582,10 @@ def hybrid_search(
 # ==============================================================================
 
 if __name__ == "__main__":
+    from core.database import close_pool, create_db_pool
+
+    create_db_pool()
+
     # Test queries
     queries = [
         "mind-bending sci-fi thriller",
@@ -606,8 +610,9 @@ if __name__ == "__main__":
         for i, r in enumerate(response["results"], 1):
             print(
                 f"  {i}. {r['title']}"
-                f" | rerank={r.get('rerank_score', 0):.3f}"
                 f" | rrf={r.get('rrf_score', 0):.6f}"
                 f" | vec_rank={r.get('vector_rank')}"
                 f" | bm25_rank={r.get('bm25_rank')}"
             )
+
+    close_pool()
