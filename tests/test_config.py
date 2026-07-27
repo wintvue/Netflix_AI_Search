@@ -133,3 +133,17 @@ class TestEnvCoercion:
     def test_empty_string_is_treated_as_unset(self, monkeypatch):
         monkeypatch.setenv("SOME_VALUE", "")
         assert config._env("SOME_VALUE", "fallback") == "fallback"
+
+
+class TestLoggingSetup:
+    def test_importing_config_does_not_configure_logging(self, monkeypatch):
+        """Logging setup used to be an import side effect of core.config."""
+        cfg = reload_config(monkeypatch)
+        assert cfg._logging_configured is False
+
+    def test_setup_logging_is_idempotent(self, monkeypatch):
+        cfg = reload_config(monkeypatch)
+        cfg.setup_logging()
+        assert cfg._logging_configured is True
+        cfg.setup_logging()  # must not raise or reconfigure
+        assert cfg._logging_configured is True

@@ -10,14 +10,6 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-# Logging configuration
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-
-
 def get_logger(name: str) -> logging.Logger:
     """Get a configured logger."""
     return logging.getLogger(name)
@@ -146,6 +138,10 @@ RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 HF_TOKEN = _env("HF_TOKEN")
 
+# Every embedding call is a network round trip; without a timeout a slow
+# upstream pins a worker thread for as long as the socket stays open.
+HF_TIMEOUT_SECONDS = _env_float("HF_TIMEOUT_SECONDS", 10.0)
+
 
 # ==============================================================================
 # Search configuration
@@ -197,3 +193,48 @@ def candidate_pool_problems() -> list[str]:
             f"({RERANK_CANDIDATES}): the final ranking will never see a full pool"
         )
     return problems
+
+
+# ==============================================================================
+# AI overview configuration
+# ==============================================================================
+
+OLLAMA_MODEL = _env("OLLAMA_MODEL", "ministral-3:8b-cloud")
+OLLAMA_HOST = _env("OLLAMA_HOST", "https://ollama.com")
+OLLAMA_API_KEY = _env("OLLAMA_API_KEY")
+OLLAMA_KEEP_ALIVE = _env("OLLAMA_KEEP_ALIVE", "10m")
+OLLAMA_TIMEOUT_SECONDS = _env_float("OLLAMA_TIMEOUT_SECONDS", 60.0)
+
+# Every movie in the prompt costs input tokens. Users read the top of an
+# overview, so summarising the whole result page is spend without a reader.
+AI_OVERVIEW_MAX_MOVIES = _env_int("AI_OVERVIEW_MAX_MOVIES", 5)
+
+# Requests per minute per client IP for the (paid) AI overview path.
+AI_OVERVIEW_RATE_LIMIT = _env_int("AI_OVERVIEW_RATE_LIMIT", 10)
+
+
+# ==============================================================================
+# Logging
+# ==============================================================================
+
+LOG_LEVEL = (_env("LOG_LEVEL", "INFO") or "INFO").upper()
+
+_logging_configured = False
+
+
+def setup_logging(level: str | None = None) -> None:
+    """
+    Configure root logging. Idempotent, so entry points can call it freely.
+
+    Kept out of import time so that importing config has no side effects.
+    """
+    global _logging_configured
+    if _logging_configured:
+        return
+
+    logging.basicConfig(
+        level=getattr(logging, level or LOG_LEVEL, logging.INFO),
+        format="%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    _logging_configured = True

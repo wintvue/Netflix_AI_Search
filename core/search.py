@@ -16,6 +16,7 @@ The pipeline:
 """
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,7 +34,7 @@ from core.config import (
     VECTOR_CANDIDATES,
     get_logger,
 )
-from core.database import get_connection, put_connection
+from core.database import connection
 from core.model import encode_query
 
 logger = get_logger(__name__)
@@ -133,6 +134,16 @@ def log_json(data: list | dict) -> str:
     return json.dumps(data, indent=2, default=str)
 
 
+def _debug_enabled() -> bool:
+    """Whether DEBUG logging is on.
+
+    Guarding the log calls below matters because their arguments serialize the
+    candidate set eagerly -- an f-string is evaluated before the logger gets to
+    decide the record is beneath the threshold.
+    """
+    return logger.isEnabledFor(logging.DEBUG)
+
+
 def normalize_scores(results: list[RetrievalResult]) -> list[RetrievalResult]:
     """
     Min-max normalize scores to [0, 1] range.
@@ -206,7 +217,6 @@ def compute_rrf(
 
     # Sort by RRF score descending
     fused.sort(key=lambda x: x.rrf_score, reverse=True)
-    logger.info(f"RRF results: {log_json(fused)}")
     return fused
 
 
@@ -267,28 +277,38 @@ def semantic_search(query: str, top_k: int = DEFAULT_TOP_K) -> list[dict]:
     start = time.time()
     q_emb = encode_query(query)
     encode_time = (time.time() - start) * 1000
-    logger.info(f"Semantic search | Encoding: {encode_time:.2f}ms")
 
     # Database search
     start = time.time()
-    conn = get_connection()
-    try:
+    with connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(SQL_SEMANTIC, (q_emb, top_k))
             rows = cur.fetchall()
-    finally:
-        put_connection(conn)
 
     db_time = (time.time() - start) * 1000
     results = [dict(row) for row in rows]
 
-    logger.info(f"Semantic search | DB: {db_time:.2f}ms | Results: {len(results)}")
     logger.info(
-        f"Semantic search | Results:\n{log_json([
-        {'rank': i+1, 'id': r['id'], 'title': r['title'], 'distance': round(r['distance'], 4)}
-        for i, r in enumerate(results)
-    ])}"
+        "Semantic search | Encode: %.2fms | DB: %.2fms | Results: %d",
+        encode_time,
+        db_time,
+        len(results),
     )
+    if _debug_enabled():
+        logger.debug(
+            "Semantic search | Results:\n%s",
+            log_json(
+                [
+                    {
+                        "rank": i + 1,
+                        "id": r["id"],
+                        "title": r["title"],
+                        "distance": round(r["distance"], 4),
+                    }
+                    for i, r in enumerate(results[:10])
+                ]
+            ),
+        )
 
     return results
 
@@ -329,13 +349,12 @@ def _retrieve_candidates(
     storing movie data for later use.
     """
     start = time.time()
-    conn = get_connection()
 
     vector_results: list[RetrievalResult] = []
     bm25_results: list[RetrievalResult] = []
     movie_rows: dict[int, dict] = {}
 
-    try:
+    with connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             # Vector search
             cur.execute(
@@ -367,27 +386,34 @@ def _retrieve_candidates(
                 )
                 if movie_id not in movie_rows:
                     movie_rows[movie_id] = row_dict
-    finally:
-        put_connection(conn)
 
     elapsed_ms = (time.time() - start) * 1000
 
     logger.info(
-        f"Retrieval | {elapsed_ms:.2f}ms | "
-        f"Vector: {len(vector_results)} | BM25: {len(bm25_results)}"
+        "Retrieval | %.2fms | Vector: %d | BM25: %d",
+        elapsed_ms,
+        len(vector_results),
+        len(bm25_results),
     )
-    logger.debug(
-        f"Retrieval | Vector top-5:\n{log_json([
-        {'rank': r.rank, 'id': r.id, 'score': round(r.score, 4)}
-        for r in vector_results[:5]
-    ])}"
-    )
-    logger.debug(
-        f"Retrieval | BM25 top-5:\n{log_json([
-        {'rank': r.rank, 'id': r.id, 'score': round(r.score, 4)}
-        for r in bm25_results[:5]
-    ])}"
-    )
+    if _debug_enabled():
+        logger.debug(
+            "Retrieval | Vector top-5:\n%s",
+            log_json(
+                [
+                    {"rank": r.rank, "id": r.id, "score": round(r.score, 4)}
+                    for r in vector_results[:5]
+                ]
+            ),
+        )
+        logger.debug(
+            "Retrieval | BM25 top-5:\n%s",
+            log_json(
+                [
+                    {"rank": r.rank, "id": r.id, "score": round(r.score, 4)}
+                    for r in bm25_results[:5]
+                ]
+            ),
+        )
 
     return RetrievalOutput(
         vector_results=vector_results,
@@ -423,15 +449,24 @@ def _fuse_with_rrf(
 
     elapsed_ms = (time.time() - start) * 1000
 
-    logger.debug(
-        f"RRF Fusion | {elapsed_ms:.2f}ms | " f"Unique candidates: {len(fused_results)}"
+    logger.info(
+        "RRF Fusion | %.2fms | Unique candidates: %d", elapsed_ms, len(fused_results)
     )
-    logger.debug(
-        f"RRF Fusion | Top-10:\n{log_json([
-        {'id': c.id, 'rrf_score': round(c.rrf_score, 6), 'vec_rank': c.vector_rank, 'bm25_rank': c.bm25_rank}
-        for c in candidates[:10]
-    ])}"
-    )
+    if _debug_enabled():
+        logger.debug(
+            "RRF Fusion | Top-10:\n%s",
+            log_json(
+                [
+                    {
+                        "id": c.id,
+                        "rrf_score": round(c.rrf_score, 6),
+                        "vec_rank": c.vector_rank,
+                        "bm25_rank": c.bm25_rank,
+                    }
+                    for c in candidates[:10]
+                ]
+            ),
+        )
 
     return FusionOutput(
         fused_results=fused_results,
@@ -496,7 +531,9 @@ def hybrid_search(
         Dict with query, config, retrieval stats, and ranked results
     """
     query = query.strip()
-    logger.info(f"Hybrid search | Query: '{query}' | Top-K: {top_k} | Alpha: {alpha}")
+    logger.info(
+        "Hybrid search | Query: '%s' | Top-K: %d | Alpha: %s", query, top_k, alpha
+    )
 
     timings = {}
 
@@ -504,7 +541,6 @@ def hybrid_search(
     start = time.time()
     query_embedding = encode_query(query)
     timings["encode_ms"] = (time.time() - start) * 1000
-    logger.info(f"Query encoding | {timings['encode_ms']:.2f}ms")
 
     # Stage 2: Parallel Retrieval
     retrieval = _retrieve_candidates(query, query_embedding)
@@ -541,21 +577,27 @@ def hybrid_search(
     timings["total_ms"] = sum(timings.values())
 
     logger.info(
-        f"Hybrid search | Final: {len(results)} results | Total: {timings['total_ms']:.2f}ms"
+        "Hybrid search | Final: %d results | Total: %.2fms",
+        len(results),
+        timings["total_ms"],
     )
-    logger.debug(
-        f"Hybrid search | Results:\n{log_json([
-        {
-            'rank': i+1,
-            'id': r['id'],
-            'title': r['title'],
-            'rrf_score': round(r.get('rrf_score', 0), 6),
-            'vec_rank': r.get('vector_rank'),
-            'bm25_rank': r.get('bm25_rank'),
-        }
-        for i, r in enumerate(results)
-    ])}"
-    )
+    if _debug_enabled():
+        logger.debug(
+            "Hybrid search | Results:\n%s",
+            log_json(
+                [
+                    {
+                        "rank": i + 1,
+                        "id": r["id"],
+                        "title": r["title"],
+                        "rrf_score": round(r.get("rrf_score", 0), 6),
+                        "vec_rank": r.get("vector_rank"),
+                        "bm25_rank": r.get("bm25_rank"),
+                    }
+                    for i, r in enumerate(results[:10])
+                ]
+            ),
+        )
 
     return {
         "query": query,
@@ -582,8 +624,10 @@ def hybrid_search(
 # ==============================================================================
 
 if __name__ == "__main__":
+    from core.config import setup_logging
     from core.database import close_pool, create_db_pool
 
+    setup_logging()
     create_db_pool()
 
     # Test queries
