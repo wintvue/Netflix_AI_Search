@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "netflix-ai-search"
 version = "2.0.0"
-description = "Hybrid movie search over Postgres + pgvector with RRF fusion and LLM overviews"
+description = "Hybrid movie search over Postgres + pgvector with RRF fusion, cross-encoder reranking, and LLM overviews"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.104.0",
@@ -16,13 +16,20 @@ dependencies = [
     "numpy>=1.24.0",
     "python-dotenv>=1.0.0",
     "huggingface_hub>=0.30.0",
+    "httpx>=0.27.0",
     "ollama>=0.4.0",
 ]
 
 [project.optional-dependencies]
 # Corpus seeding embeds locally; the web service never imports this.
 seed = ["sentence-transformers>=3.0.0"]
-dev = ["pytest>=8.0.0"]
+# Only needed for RERANK_BACKEND=local. Pulls in torch — sized for a machine
+# with real memory, not a free-tier web dyno.
+rerank = ["sentence-transformers>=3.0.0"]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
 
 [project.scripts]
 movie-search = "cli.keyword_search_cli:main"

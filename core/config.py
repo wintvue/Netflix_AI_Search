@@ -10,13 +10,6 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-# Logging configuration
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-
 
 def get_logger(name: str) -> logging.Logger:
     """Get a configured logger."""
@@ -55,7 +48,9 @@ def _env_int(name: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError:
-        logger.warning("%s=%r is not an integer, falling back to %d", name, raw, default)
+        logger.warning(
+            "%s=%r is not an integer, falling back to %d", name, raw, default
+        )
         return default
 
 
@@ -68,6 +63,13 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         logger.warning("%s=%r is not a number, falling back to %s", name, raw, default)
         return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = _env(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _legacy_env(name: str, legacy_name: str, default: str | None = None) -> str | None:
@@ -142,9 +144,38 @@ def missing_db_settings() -> list[str]:
 # ==============================================================================
 
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+# Reranking backend: "hf" calls the hosted Inference API, "local" loads a
+# cross-encoder into this process, "none" disables the stage.
+#
+# The originally-configured cross-encoder/ms-marco-MiniLM-L-6-v2 has been
+# renamed upstream (it now redirects to .../ms-marco-MiniLM-L6-v2) and, more
+# importantly, no inference provider serves it -- its inferenceProviderMapping
+# is empty, so it can only run locally. BAAI/bge-reranker-base is a comparable
+# cross-encoder that *is* live on hf-inference, exposed as text-classification
+# over sentence pairs, so it is the default for the hosted path.
+RERANK_BACKEND = (_env("RERANK_BACKEND", "hf") or "hf").lower()
+RERANK_MODEL_NAME = _env("RERANK_MODEL_NAME", "BAAI/bge-reranker-base")
+RERANK_LOCAL_MODEL_NAME = _env(
+    "RERANK_LOCAL_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L6-v2"
+)
+RERANK_BATCH_SIZE = _env_int("RERANK_BATCH_SIZE", 32)
 
 HF_TOKEN = _env("HF_TOKEN")
+HF_ROUTER_URL = _env("HF_ROUTER_URL", "https://router.huggingface.co/hf-inference")
+
+# Every embedding/rerank call is a network round trip; without a timeout a slow
+# upstream pins a worker thread for as long as the socket stays open.
+HF_TIMEOUT_SECONDS = _env_float("HF_TIMEOUT_SECONDS", 10.0)
+
+# Queries repeat heavily in a search workload, and the embedding is on the
+# critical path before the database is touched.
+EMBED_CACHE_SIZE = _env_int("EMBED_CACHE_SIZE", 512)
+
+# Reranking is the most expensive stage; keep it switchable without a redeploy.
+# It is best-effort: a failure logs and falls back to the RRF order rather than
+# failing the search, so defaulting it on cannot take the endpoint down.
+RERANK_ENABLED = _env_bool("RERANK_ENABLED", True) and RERANK_BACKEND != "none"
 
 
 # ==============================================================================
@@ -162,7 +193,7 @@ MAX_TOP_K = _env_int("MAX_TOP_K", 100)
 VECTOR_CANDIDATES = _env_int("VECTOR_CANDIDATES", 150)
 BM25_CANDIDATES = _env_int("BM25_CANDIDATES", 150)
 
-# Number of fused candidates kept for the final ranking.
+# Number of fused candidates handed to the reranker.
 RERANK_CANDIDATES = _env_int("RERANK_CANDIDATES", 100)
 
 # Reciprocal Rank Fusion (RRF) parameters.
@@ -174,6 +205,10 @@ RRF_K = _env_int("RRF_K", 60)
 # alpha=1.0 -> pure vector, alpha=0.0 -> pure BM25
 # 0.5-0.7 is typical for balanced hybrid search
 HYBRID_ALPHA = _env_float("HYBRID_ALPHA", 0.8)
+
+# Cache of complete search responses, keyed on (query, k, alpha).
+SEARCH_CACHE_SIZE = _env_int("SEARCH_CACHE_SIZE", 256)
+SEARCH_CACHE_TTL_SECONDS = _env_float("SEARCH_CACHE_TTL_SECONDS", 60.0)
 
 
 def candidate_pool_problems() -> list[str]:
@@ -194,6 +229,51 @@ def candidate_pool_problems() -> list[str]:
         problems.append(
             f"VECTOR_CANDIDATES ({VECTOR_CANDIDATES}) and BM25_CANDIDATES "
             f"({BM25_CANDIDATES}) are both below RERANK_CANDIDATES "
-            f"({RERANK_CANDIDATES}): the final ranking will never see a full pool"
+            f"({RERANK_CANDIDATES}): the reranker will never see a full pool"
         )
     return problems
+
+
+# ==============================================================================
+# AI overview configuration
+# ==============================================================================
+
+OLLAMA_MODEL = _env("OLLAMA_MODEL", "minimax-m2.5:cloud")
+OLLAMA_HOST = _env("OLLAMA_HOST", "https://ollama.com")
+OLLAMA_API_KEY = _env("OLLAMA_API_KEY")
+OLLAMA_KEEP_ALIVE = _env("OLLAMA_KEEP_ALIVE", "10m")
+OLLAMA_TIMEOUT_SECONDS = _env_float("OLLAMA_TIMEOUT_SECONDS", 60.0)
+
+# Every movie in the prompt costs input tokens. Users read the top of an
+# overview, so summarising the whole result page is spend without a reader.
+AI_OVERVIEW_MAX_MOVIES = _env_int("AI_OVERVIEW_MAX_MOVIES", 5)
+
+# Requests per minute per client IP for the (paid) AI overview path.
+AI_OVERVIEW_RATE_LIMIT = _env_int("AI_OVERVIEW_RATE_LIMIT", 10)
+
+
+# ==============================================================================
+# Logging
+# ==============================================================================
+
+LOG_LEVEL = (_env("LOG_LEVEL", "INFO") or "INFO").upper()
+
+_logging_configured = False
+
+
+def setup_logging(level: str | None = None) -> None:
+    """
+    Configure root logging. Idempotent, so entry points can call it freely.
+
+    Kept out of import time so that importing config has no side effects.
+    """
+    global _logging_configured
+    if _logging_configured:
+        return
+
+    logging.basicConfig(
+        level=getattr(logging, level or LOG_LEVEL, logging.INFO),
+        format="%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    _logging_configured = True
