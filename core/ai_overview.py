@@ -3,7 +3,6 @@
 
 import json
 import re
-import threading
 import time
 from typing import Literal, TypedDict
 
@@ -21,9 +20,9 @@ from core.config import (
 
 logger = get_logger(__name__)
 
-# Singleton client
+# Lazily built singleton. Unlocked: a race builds one extra client that is
+# immediately dropped, which is cheaper than a mutex on every overview request.
 _ollama_client: Client | None = None
-_client_lock = threading.Lock()
 
 # Status type
 Status = Literal["success", "parse_error", "error", "no_results"]
@@ -35,18 +34,14 @@ def get_ollama_client() -> Client:
     if _ollama_client is not None:
         return _ollama_client
 
-    with _client_lock:
-        if _ollama_client is None:
-            headers = (
-                {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
-            )
-            # Without a timeout a stalled generation pins a worker thread for
-            # as long as the socket stays open.
-            _ollama_client = Client(
-                host=OLLAMA_HOST,
-                headers=headers or None,
-                timeout=OLLAMA_TIMEOUT_SECONDS,
-            )
+    headers = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
+    # Without a timeout a stalled generation pins a worker thread for as long
+    # as the socket stays open.
+    _ollama_client = Client(
+        host=OLLAMA_HOST,
+        headers=headers or None,
+        timeout=OLLAMA_TIMEOUT_SECONDS,
+    )
     return _ollama_client
 
 

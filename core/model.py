@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Embedding and reranking backed by the Hugging Face Inference API."""
 
-import threading
 import time
 from functools import lru_cache
 
@@ -24,11 +23,11 @@ from core.errors import ConfigurationError, EmbeddingError, RerankError
 
 logger = get_logger(__name__)
 
-# Singleton instances, guarded because worker threads share them.
+# Lazily built singletons shared by worker threads. Unlocked: a race builds one
+# extra instance that is immediately dropped, which is cheaper than serializing
+# every caller behind a mutex for the life of the process.
 _client: InferenceClient | None = None
-_client_lock = threading.Lock()
 _local_reranker = None
-_local_reranker_lock = threading.Lock()
 
 # One retry only: a longer chain would outlive the caller's own timeout budget.
 _MAX_ATTEMPTS = 2
@@ -41,20 +40,19 @@ def get_huggingface_client() -> InferenceClient:
     if _client is not None:
         return _client
 
-    with _client_lock:
-        if _client is None:
-            if not HF_TOKEN:
-                raise ConfigurationError(
-                    "HF_TOKEN is not set; the Hugging Face Inference API cannot "
-                    "be reached. Add it to your .env (see .env.example)."
-                )
-            logger.info("Loading Hugging Face client")
-            _client = InferenceClient(
-                provider="auto",
-                api_key=HF_TOKEN,
-                timeout=HF_TIMEOUT_SECONDS,
-            )
-            logger.info("Hugging Face client loaded successfully")
+    if not HF_TOKEN:
+        raise ConfigurationError(
+            "HF_TOKEN is not set; the Hugging Face Inference API cannot "
+            "be reached. Add it to your .env (see .env.example)."
+        )
+
+    logger.info("Loading Hugging Face client")
+    _client = InferenceClient(
+        provider="auto",
+        api_key=HF_TOKEN,
+        timeout=HF_TIMEOUT_SECONDS,
+    )
+    logger.info("Hugging Face client loaded successfully")
     return _client
 
 
@@ -237,19 +235,17 @@ def _get_local_reranker():
     if _local_reranker is not None:
         return _local_reranker
 
-    with _local_reranker_lock:
-        if _local_reranker is None:
-            try:
-                from sentence_transformers import CrossEncoder
-            except ImportError as e:
-                raise ConfigurationError(
-                    "RERANK_BACKEND=local needs sentence-transformers: "
-                    "pip install -e '.[rerank]'"
-                ) from e
+    try:
+        from sentence_transformers import CrossEncoder
+    except ImportError as e:
+        raise ConfigurationError(
+            "RERANK_BACKEND=local needs sentence-transformers: "
+            "pip install -e '.[rerank]'"
+        ) from e
 
-            logger.info("Loading local reranker: %s", RERANK_LOCAL_MODEL_NAME)
-            _local_reranker = CrossEncoder(RERANK_LOCAL_MODEL_NAME)
-            logger.info("Local reranker loaded")
+    logger.info("Loading local reranker: %s", RERANK_LOCAL_MODEL_NAME)
+    _local_reranker = CrossEncoder(RERANK_LOCAL_MODEL_NAME)
+    logger.info("Local reranker loaded")
     return _local_reranker
 
 

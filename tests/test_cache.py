@@ -64,22 +64,29 @@ class TestTTLCache:
         assert info["size"] == 1
 
     def test_is_thread_safe(self):
-        """The cache is shared across the request threadpool."""
-        cache = TTLCache(maxsize=100, ttl_seconds=60)
+        """
+        The cache is shared across the request threadpool and holds no lock, so
+        every thread contends on the same keys with the cache far past capacity.
+        That forces the interleavings the lock used to hide: one thread evicting
+        or expiring a key while another is mid-lookup on it.
+        """
+        cache = TTLCache(maxsize=8, ttl_seconds=0.001)
         errors = []
 
-        def hammer(n):
+        def hammer(_n):
             try:
-                for i in range(200):
-                    cache.set(f"{n}-{i}", i)
-                    cache.get(f"{n}-{i}")
-            except Exception as e:  # pragma: no cover - only on a locking bug
+                for i in range(500):
+                    key = f"shared-{i % 16}"
+                    cache.set(key, i)
+                    cache.get(key)
+            except Exception as e:  # pragma: no cover - only on a race
                 errors.append(e)
 
-        threads = [threading.Thread(target=hammer, args=(n,)) for n in range(4)]
+        threads = [threading.Thread(target=hammer, args=(n,)) for n in range(8)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
 
         assert errors == []
+        assert cache.info()["size"] <= 8
