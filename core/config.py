@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv(Path(__file__).parent.parent / ".env")
 
+
 def get_logger(name: str) -> logging.Logger:
     """Get a configured logger."""
     return logging.getLogger(name)
@@ -47,7 +48,9 @@ def _env_int(name: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError:
-        logger.warning("%s=%r is not an integer, falling back to %d", name, raw, default)
+        logger.warning(
+            "%s=%r is not an integer, falling back to %d", name, raw, default
+        )
         return default
 
 
@@ -235,7 +238,7 @@ def candidate_pool_problems() -> list[str]:
 # AI overview configuration
 # ==============================================================================
 
-OLLAMA_MODEL = _env("OLLAMA_MODEL", "ministral-3:8b-cloud")
+OLLAMA_MODEL = _env("OLLAMA_MODEL", "minimax-m2.5:cloud")
 OLLAMA_HOST = _env("OLLAMA_HOST", "https://ollama.com")
 OLLAMA_API_KEY = _env("OLLAMA_API_KEY")
 OLLAMA_KEEP_ALIVE = _env("OLLAMA_KEEP_ALIVE", "10m")
